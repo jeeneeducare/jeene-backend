@@ -1,4 +1,4 @@
-fastapi
-uvicorn[standard]
-asyncpg
-pydantic-settings
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+asyncpg==0.31.0
+pydantic-settings==2.14.2

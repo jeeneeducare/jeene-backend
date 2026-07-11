@@ -1,8 +1,11 @@
+import logging
 from typing import AsyncIterator
 
 import asyncpg
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
@@ -10,6 +13,7 @@ _pool: asyncpg.Pool | None = None
 async def connect_pool() -> None:
     global _pool
     if not settings.database_url:
+        logger.error("DATABASE_URL is not set; the connection pool will not be created")
         _pool = None
         return
     try:
@@ -19,6 +23,7 @@ async def connect_pool() -> None:
             statement_cache_size=0,
         )
     except Exception:
+        logger.exception("Failed to connect to the database")
         _pool = None
 
 
