@@ -5,11 +5,11 @@ The backend is the app's single interface and the only thing that touches the da
 - New repo, currently only docs (`docs/PRD.md`, `CLAUDE.md`, `docs/PROCESS.md`) and HTF scaffolding.
 - Stack per `CLAUDE.md`: FastAPI (async, Python 3.12+), an `asyncpg` pool to Supabase Postgres (Singapore), deployed on Render (Singapore), co-located with the DB.
 - The content database already exists in Supabase (7 tables, `phy_11_ch4` ingested). This ticket does **not** query content, it only confirms the DB is reachable with `SELECT 1`.
-- **Deploy split:** the Manager owns the Render account and secrets. The developer delivers deployable code, a `render.yaml` blueprint, `.env.example`, and a short `DEPLOY.md`. The Manager creates the Render service from the blueprint and pastes in `DATABASE_URL`.
+- **Deploy:** the developer owns the deploy end to end. Using access to the `jeeneeducare` Render workspace, they create the web service from the committed `render.yaml`, set `DATABASE_URL` in the Render dashboard (never in the repo), deploy, and confirm the public `/health` is green. They also write `DEPLOY.md` documenting the steps so the deploy is reproducible for the team.
 
 ## 🔑 Access & prerequisites
 - **`DATABASE_URL`** — the Supabase connection string (session pooler). **Obtain it from the Manager via a secure channel** (or, if you are given Supabase dashboard access, dashboard → Connect → Session pooler). Put it in a local `.env` (git-ignored). **Never commit it.**
-- **Render account** — the Manager sets up the service; the developer only provides config and steps.
+- **Render workspace access** — the developer needs access to the `jeeneeducare` Render workspace to create the service and deploy. Ask the Manager for an invite.
 - Python 3.12+ locally.
 
 ## ✅ Scope / What to build
@@ -19,15 +19,16 @@ The backend is the app's single interface and the only thing that touches the da
 - [ ] `requirements.txt` (fastapi, uvicorn[standard], asyncpg).
 - [ ] `.env.example` documenting `DATABASE_URL` by name only (no value).
 - [ ] `render.yaml` blueprint: a Python web service, Singapore region, pip-install build + uvicorn start commands, `DATABASE_URL` declared as a dashboard-set env var (not synced from the repo).
-- [ ] `DEPLOY.md` with click-by-click Render setup steps for the Manager.
+- [ ] Create the Render web service from `render.yaml`, set `DATABASE_URL`, deploy, and confirm the public `/health` is green.
+- [ ] `DEPLOY.md` documenting the Render steps so the deploy is reproducible.
 
 ## 🎯 Acceptance Criteria
 - [ ] Locally, with `DATABASE_URL` set, `uvicorn app.main:app` starts and `GET /health` returns 200 `{"status":"ok","db":"ok"}`.
 - [ ] With a bad or unset `DATABASE_URL`, `/health` returns a clear 503, not a stack-trace crash.
 - [ ] No secrets committed; `.env` is git-ignored; `.env.example` lists names only.
 - [ ] Code follows `CLAUDE.md`: async throughout, parameterized SQL, typed responses.
-- [ ] `render.yaml` is present and valid; the Manager can create the Render service from it and set `DATABASE_URL`.
-- [ ] Deployed live on Render (Singapore): the public `/health` URL returns ok. *(Joint step: developer provides config + `DEPLOY.md`; Manager creates the service and sets the secret.)*
+- [ ] `render.yaml` is present and valid, and the service is created from it.
+- [ ] Deployed live on Render (Singapore) by the developer: the public `/health` URL returns `{"status":"ok","db":"ok"}`.
 
 ## 🚫 Out of scope
 - Any content endpoints (Ticket 2).
