@@ -8,7 +8,7 @@ The backend is the app's single interface and the only thing that touches the da
 - **Deploy split:** the Manager owns the Render account and secrets. The developer delivers deployable code, a `render.yaml` blueprint, `.env.example`, and a short `DEPLOY.md`. The Manager creates the Render service from the blueprint and pastes in `DATABASE_URL`.
 
 ## 🔑 Access & prerequisites
-- **`DATABASE_URL`** — the Supabase connection string (session pooler). Get it from the existing local `~/.jeene.env` (`JEENE_POSTGRES_URL`) or Supabase dashboard → Connect → Session pooler. **Never commit it.**
+- **`DATABASE_URL`** — the Supabase connection string (session pooler). **Obtain it from the Manager via a secure channel** (or, if you are given Supabase dashboard access, dashboard → Connect → Session pooler). Put it in a local `.env` (git-ignored). **Never commit it.**
 - **Render account** — the Manager sets up the service; the developer only provides config and steps.
 - Python 3.12+ locally.
 
