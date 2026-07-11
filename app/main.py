@@ -4,7 +4,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from app import db
-from app.routers import health
+from app.routers import content, health
 
 
 @asynccontextmanager
@@ -16,3 +16,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Jeene Backend", lifespan=lifespan)
 app.include_router(health.router)
+app.include_router(content.router)

@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import AsyncIterator
 
@@ -8,6 +9,16 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
+
+
+async def _init_connection(connection: asyncpg.Connection) -> None:
+    await connection.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+        format="text",
+    )
 
 
 async def connect_pool() -> None:
@@ -21,6 +32,7 @@ async def connect_pool() -> None:
             dsn=settings.database_url,
             ssl="require",
             statement_cache_size=0,
+            init=_init_connection,
         )
     except Exception:
         logger.exception("Failed to connect to the database")
