@@ -25,7 +25,7 @@ async def list_chapters(
         """
         SELECT node_id, title, ncert_chapter_number, subject_id, class_level
         FROM nodes
-        WHERE tenant_id = $1 AND type = 'chapter'
+        WHERE tenant_id = $1 AND type = 'chapter' AND status = 'published'
         ORDER BY ncert_chapter_number NULLS LAST, title
         """,
         TENANT_ID,
@@ -75,7 +75,7 @@ async def list_concept_questions(
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> PaginatedQuestions:
     exists = await connection.fetchval(
-        "SELECT 1 FROM nodes WHERE tenant_id = $1 AND node_id = $2 AND type = 'concept'",
+        "SELECT 1 FROM nodes WHERE tenant_id = $1 AND node_id = $2 AND type = 'concept' AND status = 'published'",
         TENANT_ID,
         concept_id,
     )
@@ -93,7 +93,7 @@ async def get_question(
         """
         SELECT question_id, question_type, question_text, options_json, difficulty
         FROM questions
-        WHERE tenant_id = $1 AND question_id = $2
+        WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
         """,
         TENANT_ID,
         question_id,
@@ -113,7 +113,7 @@ async def get_question_answer(
         """
         SELECT question_id, correct_option_ids, explanation_json
         FROM questions
-        WHERE tenant_id = $1 AND question_id = $2
+        WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
         """,
         TENANT_ID,
         question_id,
@@ -144,12 +144,12 @@ async def _fetch_chapter_subtree(
         WITH RECURSIVE descendants AS (
             SELECT node_id, type, title, description, parent_id, depth, display_order
             FROM nodes
-            WHERE tenant_id = $1 AND node_id = $2 AND type = 'chapter'
+            WHERE tenant_id = $1 AND node_id = $2 AND type = 'chapter' AND status = 'published'
             UNION ALL
             SELECT n.node_id, n.type, n.title, n.description, n.parent_id, n.depth, n.display_order
             FROM nodes n
             JOIN descendants d ON n.parent_id = d.node_id
-            WHERE n.tenant_id = $1
+            WHERE n.tenant_id = $1 AND n.status = 'published'
         )
         SELECT * FROM descendants ORDER BY depth, display_order
         """,
@@ -183,10 +183,12 @@ async def _paginated_questions_for_node_ids(
 ) -> PaginatedQuestions:
     total = await connection.fetchval(
         """
-        SELECT COUNT(DISTINCT qcm.question_id)
-        FROM question_concept_mappings qcm
-        WHERE qcm.concept_node_id = ANY($1::text[])
+        SELECT COUNT(DISTINCT q.question_id)
+        FROM questions q
+        JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
+        WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
         """,
+        TENANT_ID,
         node_ids,
     )
     rows = await connection.fetch(
@@ -194,7 +196,7 @@ async def _paginated_questions_for_node_ids(
         SELECT DISTINCT q.question_id, q.question_type, q.question_text, q.options_json, q.difficulty
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
-        WHERE q.tenant_id = $1 AND qcm.concept_node_id = ANY($2::text[])
+        WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
         ORDER BY q.question_id
         LIMIT $3 OFFSET $4
         """,
