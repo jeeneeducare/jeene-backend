@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import AsyncIterator
@@ -27,16 +28,29 @@ async def connect_pool() -> None:
         logger.error("DATABASE_URL is not set; the connection pool will not be created")
         _pool = None
         return
-    try:
-        _pool = await asyncpg.create_pool(
-            dsn=settings.database_url,
-            ssl="require",
-            statement_cache_size=0,
-            init=_init_connection,
-        )
-    except Exception:
-        logger.exception("Failed to connect to the database")
-        _pool = None
+    # Keep min_size small so a fresh instance only needs one connection to come up
+    # (the Supabase pooler has a limited client budget); retry so a transient
+    # saturation at startup self-heals instead of leaving the instance DB-down.
+    last_exc: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn=settings.database_url,
+                ssl="require",
+                statement_cache_size=0,
+                min_size=1,
+                max_size=5,
+                command_timeout=30,
+                init=_init_connection,
+            )
+            logger.info("Database pool connected (attempt %d)", attempt)
+            return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("DB pool connect attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(min(2 * attempt, 8))
+    logger.error("Failed to connect the database pool after retries", exc_info=last_exc)
+    _pool = None
 
 
 async def disconnect_pool() -> None:
