@@ -13,6 +13,7 @@ class Chapter(BaseModel):
     title: str
     chapter_number: int | None
     subject: str | None
+    subject_name: str | None
     class_level: int | None
 
 

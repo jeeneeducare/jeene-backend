@@ -73,10 +73,41 @@ def _all_keys(obj, acc):
 
 
 @integration
-def test_list_chapters_includes_phy_11_ch4(client):
+def test_list_chapters_includes_phy_11_ch4_with_subject_name(client):
     r = client.get("/chapters")
     assert r.status_code == 200
-    assert "phy_11_ch4" in [c["node_id"] for c in r.json()]
+    chapters = r.json()
+    by_id = {c["node_id"]: c for c in chapters}
+    assert "phy_11_ch4" in by_id
+    # subject display name is resolved from the subject node, not hardcoded
+    assert by_id["phy_11_ch4"]["subject"] == "phy"
+    assert by_id["phy_11_ch4"]["subject_name"] == "Physics"
+
+
+@integration
+def test_list_chapters_class_level_filter(client):
+    # class 11 physics chapters exist; class 12 has none yet
+    r11 = client.get("/chapters?class_level=11")
+    assert r11.status_code == 200
+    assert all(c["class_level"] == 11 for c in r11.json())
+    assert "phy_11_ch4" in [c["node_id"] for c in r11.json()]
+
+    r12 = client.get("/chapters?class_level=12")
+    assert r12.status_code == 200
+    assert r12.json() == []
+
+
+@integration
+def test_list_chapters_exam_filter(client):
+    # neet includes physics (subjects = phy/chem/bio), so physics chapters show
+    r_neet = client.get("/chapters?exam=neet")
+    assert r_neet.status_code == 200
+    assert "phy_11_ch4" in [c["node_id"] for c in r_neet.json()]
+
+    # an unknown/unseeded exam scopes to nothing rather than leaking everything
+    r_unknown = client.get("/chapters?exam=does_not_exist")
+    assert r_unknown.status_code == 200
+    assert r_unknown.json() == []
 
 
 @integration
