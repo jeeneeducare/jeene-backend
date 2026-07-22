@@ -19,16 +19,26 @@ router = APIRouter()
 
 @router.get("/chapters", response_model=list[Chapter])
 async def list_chapters(
+    class_level: int | None = Query(default=None, ge=1),
+    exam: str | None = Query(default=None),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[Chapter]:
     rows = await connection.fetch(
         """
-        SELECT node_id, title, ncert_chapter_number, subject_id, class_level
-        FROM nodes
-        WHERE tenant_id = $1 AND type = 'chapter' AND status = 'published'
-        ORDER BY ncert_chapter_number NULLS LAST, title
+        SELECT c.node_id, c.title, c.ncert_chapter_number, c.subject_id, c.class_level,
+               s.title AS subject_name
+        FROM nodes c
+        LEFT JOIN nodes s
+            ON s.tenant_id = c.tenant_id AND s.type = 'subject' AND s.subject_id = c.subject_id
+        WHERE c.tenant_id = $1 AND c.type = 'chapter' AND c.status = 'published'
+          AND ($2::int IS NULL OR c.class_level = $2)
+          AND ($3::text IS NULL OR EXISTS (
+                SELECT 1 FROM exams e WHERE e.exam_id = $3 AND c.subject_id = ANY(e.subjects)))
+        ORDER BY c.subject_id, c.class_level, c.ncert_chapter_number NULLS LAST, c.title
         """,
         TENANT_ID,
+        class_level,
+        exam,
     )
     return [
         Chapter(
@@ -36,6 +46,7 @@ async def list_chapters(
             title=r["title"],
             chapter_number=r["ncert_chapter_number"],
             subject=r["subject_id"],
+            subject_name=r["subject_name"],
             class_level=r["class_level"],
         )
         for r in rows
