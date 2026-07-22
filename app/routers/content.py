@@ -1,6 +1,7 @@
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.auth import current_tenant
 from app.db import get_connection
 from app.schemas import (
     Chapter,
@@ -12,8 +13,6 @@ from app.schemas import (
     TreeNode,
 )
 
-TENANT_ID = "JEENE_MASTER"
-
 router = APIRouter()
 
 
@@ -21,6 +20,7 @@ router = APIRouter()
 async def list_chapters(
     class_level: int | None = Query(default=None, ge=1),
     exam: str | None = Query(default=None),
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[Chapter]:
     rows = await connection.fetch(
@@ -36,7 +36,7 @@ async def list_chapters(
                 SELECT 1 FROM exams e WHERE e.exam_id = $3 AND c.subject_id = ANY(e.subjects)))
         ORDER BY c.subject_id, c.class_level, c.ncert_chapter_number NULLS LAST, c.title
         """,
-        TENANT_ID,
+        tenant,
         class_level,
         exam,
     )
@@ -56,9 +56,10 @@ async def list_chapters(
 @router.get("/chapters/{chapter_id}/tree", response_model=TreeNode)
 async def get_chapter_tree(
     chapter_id: str,
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TreeNode:
-    rows = await _fetch_chapter_subtree(connection, chapter_id)
+    rows = await _fetch_chapter_subtree(connection, chapter_id, tenant)
     if not rows:
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     return _build_tree(rows, chapter_id)
@@ -69,13 +70,14 @@ async def list_chapter_questions(
     chapter_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> PaginatedQuestions:
-    rows = await _fetch_chapter_subtree(connection, chapter_id)
+    rows = await _fetch_chapter_subtree(connection, chapter_id, tenant)
     if not rows:
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
-    return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset)
+    return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
 
 
 @router.get("/concepts/{concept_id}/questions", response_model=PaginatedQuestions)
@@ -83,21 +85,23 @@ async def list_concept_questions(
     concept_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> PaginatedQuestions:
     exists = await connection.fetchval(
         "SELECT 1 FROM nodes WHERE tenant_id = $1 AND node_id = $2 AND type = 'concept' AND status = 'published'",
-        TENANT_ID,
+        tenant,
         concept_id,
     )
     if not exists:
         raise HTTPException(status_code=404, detail=f"Concept '{concept_id}' not found")
-    return await _paginated_questions_for_node_ids(connection, [concept_id], limit, offset)
+    return await _paginated_questions_for_node_ids(connection, [concept_id], limit, offset, tenant)
 
 
 @router.get("/questions/{question_id}", response_model=Question)
 async def get_question(
     question_id: str,
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> Question:
     row = await connection.fetchrow(
@@ -106,7 +110,7 @@ async def get_question(
         FROM questions
         WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
         """,
-        TENANT_ID,
+        tenant,
         question_id,
     )
     if row is None:
@@ -118,6 +122,7 @@ async def get_question(
 @router.get("/questions/{question_id}/answer", response_model=QuestionAnswer)
 async def get_question_answer(
     question_id: str,
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> QuestionAnswer:
     row = await connection.fetchrow(
@@ -126,7 +131,7 @@ async def get_question_answer(
         FROM questions
         WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
         """,
-        TENANT_ID,
+        tenant,
         question_id,
     )
     if row is None:
@@ -148,7 +153,7 @@ async def get_question_answer(
 
 
 async def _fetch_chapter_subtree(
-    connection: asyncpg.Connection, chapter_id: str
+    connection: asyncpg.Connection, chapter_id: str, tenant: str
 ) -> list[asyncpg.Record]:
     return await connection.fetch(
         """
@@ -164,7 +169,7 @@ async def _fetch_chapter_subtree(
         )
         SELECT * FROM descendants ORDER BY depth, display_order
         """,
-        TENANT_ID,
+        tenant,
         chapter_id,
     )
 
@@ -190,7 +195,7 @@ def _build_tree(rows: list[asyncpg.Record], chapter_id: str) -> TreeNode:
 
 
 async def _paginated_questions_for_node_ids(
-    connection: asyncpg.Connection, node_ids: list[str], limit: int, offset: int
+    connection: asyncpg.Connection, node_ids: list[str], limit: int, offset: int, tenant: str
 ) -> PaginatedQuestions:
     total = await connection.fetchval(
         """
@@ -199,7 +204,7 @@ async def _paginated_questions_for_node_ids(
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
         """,
-        TENANT_ID,
+        tenant,
         node_ids,
     )
     rows = await connection.fetch(
@@ -211,7 +216,7 @@ async def _paginated_questions_for_node_ids(
         ORDER BY q.question_id
         LIMIT $3 OFFSET $4
         """,
-        TENANT_ID,
+        tenant,
         node_ids,
         limit,
         offset,

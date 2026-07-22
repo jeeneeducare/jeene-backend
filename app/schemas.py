@@ -58,3 +58,29 @@ class PaginatedQuestions(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class SessionRequest(BaseModel):
+    # Sent by the app after a Firebase sign-in. Onboarding captured class/exam;
+    # name is asked at first login. All optional so re-login doesn't overwrite.
+    display_name: str | None = None
+    class_level: int | None = None
+    target_exam: str | None = None
+
+
+class ProfileUpdate(BaseModel):
+    display_name: str | None = None
+    class_level: int | None = None
+    target_exam: str | None = None
+
+
+class UserProfile(BaseModel):
+    firebase_uid: str
+    tenant_id: str
+    display_name: str | None
+    email: str | None
+    phone: str | None
+    class_level: int | None
+    target_exam: str | None
+    auth_provider: str | None
+    is_new: bool = False

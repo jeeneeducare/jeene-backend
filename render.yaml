@@ -11,3 +11,7 @@ services:
         value: 3.12.7
       - key: DATABASE_URL
         sync: false
+      # Firebase Admin service-account JSON (the whole file's contents, pasted
+      # in the Render dashboard). Used to verify Firebase ID tokens.
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
