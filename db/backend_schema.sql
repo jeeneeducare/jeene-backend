@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
   class_level    INTEGER,
   target_exam    TEXT,
   auth_provider  TEXT,
+  photo_url      TEXT,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_login_at  TIMESTAMPTZ
