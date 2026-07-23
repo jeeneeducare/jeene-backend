@@ -72,6 +72,7 @@ class ProfileUpdate(BaseModel):
     display_name: str | None = None
     class_level: int | None = None
     target_exam: str | None = None
+    photo_url: str | None = None
 
 
 class UserProfile(BaseModel):
@@ -83,4 +84,5 @@ class UserProfile(BaseModel):
     class_level: int | None
     target_exam: str | None
     auth_provider: str | None
+    photo_url: str | None
     is_new: bool = False
