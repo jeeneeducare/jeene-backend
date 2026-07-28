@@ -106,9 +106,12 @@ async def get_question(
 ) -> Question:
     row = await connection.fetchrow(
         """
-        SELECT question_id, question_type, question_text, options_json, difficulty
-        FROM questions
-        WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
+        SELECT q.question_id, q.question_type, q.question_text, q.options_json, q.difficulty,
+               (SELECT array_agg(m.concept_node_id)
+                  FROM question_concept_mappings m
+                 WHERE m.question_id = q.question_id) AS concept_ids
+        FROM questions q
+        WHERE q.tenant_id = $1 AND q.question_id = $2 AND q.status = 'published'
         """,
         tenant,
         question_id,
@@ -209,7 +212,10 @@ async def _paginated_questions_for_node_ids(
     )
     rows = await connection.fetch(
         """
-        SELECT DISTINCT q.question_id, q.question_type, q.question_text, q.options_json, q.difficulty
+        SELECT DISTINCT q.question_id, q.question_type, q.question_text, q.options_json, q.difficulty,
+               (SELECT array_agg(m.concept_node_id)
+                  FROM question_concept_mappings m
+                 WHERE m.question_id = q.question_id) AS concept_ids
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
@@ -268,4 +274,5 @@ def _row_to_question(
         options=row["options_json"],
         difficulty=row["difficulty"],
         figures=figures_by_question.get(row["question_id"], []),
+        concept_ids=list(row["concept_ids"] or []) if "concept_ids" in row else [],
     )

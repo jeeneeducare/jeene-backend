@@ -39,6 +39,10 @@ class Question(BaseModel):
     options: list[dict[str, Any]] | None
     difficulty: str | None
     figures: list[QuestionFigure] = []
+    # The concepts this question is tagged to, so the app can filter a chapter's
+    # questions down to one topic without another round trip. Not an answer leak:
+    # these are tree node ids, the same ones /chapters/{id}/tree already exposes.
+    concept_ids: list[str] = []
 
 
 class ConceptTag(BaseModel):
