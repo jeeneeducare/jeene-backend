@@ -79,6 +79,59 @@ class ProfileUpdate(BaseModel):
     photo_url: str | None = None
 
 
+class AttemptRequest(BaseModel):
+    # Client-generated UUID so a retry cannot record the same answer twice.
+    attempt_id: str
+    question_id: str
+    selected_option_ids: list[str] = []
+    numeric_answer: float | None = None
+    time_spent_ms: int | None = None
+    # Set for a timed test; practice leaves it empty.
+    session_id: str | None = None
+    # Practice asks for the worked solution back; a test does not, so the answer
+    # stays hidden until the test is submitted.
+    include_solution: bool = True
+
+
+class AttemptResult(BaseModel):
+    attempt_id: str
+    question_id: str
+    is_correct: bool
+    # Only populated when include_solution was requested.
+    correct_option_ids: list[str] | None = None
+    explanation: dict[str, Any] | None = None
+    # True when this attempt_id was already recorded (a retry), so the client can
+    # tell a replay from a fresh grade.
+    already_recorded: bool = False
+
+
+class ConceptProgress(BaseModel):
+    node_id: str
+    title: str
+    attempted: int
+    correct: int
+    accuracy: float
+
+
+class ScopeProgress(BaseModel):
+    node_id: str
+    title: str
+    attempted: int
+    correct: int
+    accuracy: float
+    time_spent_ms: int
+
+
+class ProgressSummary(BaseModel):
+    attempted: int
+    correct: int
+    accuracy: float
+    time_spent_ms: int
+    distinct_questions: int
+    subjects: list[ScopeProgress] = []
+    chapters: list[ScopeProgress] = []
+
+
 class UserProfile(BaseModel):
     firebase_uid: str
     tenant_id: str
