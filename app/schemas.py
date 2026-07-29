@@ -116,10 +116,27 @@ class ConceptProgress(BaseModel):
 class ScopeProgress(BaseModel):
     node_id: str
     title: str
+    # Attempt counts: how many answers were submitted, and how many were right.
     attempted: int
     correct: int
     accuracy: float
     time_spent_ms: int
+    # Coverage: distinct questions touched out of what exists in this scope. This
+    # is what a progress ring means ("how far through the material am I"), which
+    # is a different question from accuracy.
+    total_questions: int = 0
+    attempted_questions: int = 0
+    solved_questions: int = 0
+
+    @property
+    def coverage(self) -> float:
+        return round(self.attempted_questions / self.total_questions, 4) if self.total_questions else 0.0
+
+
+class ChapterProgressDetail(BaseModel):
+    chapter: ScopeProgress
+    topics: list[ScopeProgress] = []
+    concepts: list[ConceptProgress] = []
 
 
 class ProgressSummary(BaseModel):
