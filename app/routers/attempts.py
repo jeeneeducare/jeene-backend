@@ -6,6 +6,7 @@ from app.db import get_connection
 from app.schemas import (
     AttemptRequest,
     AttemptResult,
+    ChapterProgressDetail,
     ConceptProgress,
     ProgressSummary,
     ScopeProgress,
@@ -97,13 +98,54 @@ def _grade(question: asyncpg.Record, body: AttemptRequest) -> bool:
     return set(body.selected_option_ids) == key
 
 
+# One row per (question, chapter) that exists in the published tree, joined to what
+# this student has done with it. Coverage needs the denominator — how many questions
+# exist in a scope — which only this shape gives.
+_SCOPE_PROGRESS_SQL = """
+WITH scope AS (
+    SELECT DISTINCT q.question_id,
+           chapter.node_id  AS chapter_id,
+           chapter.title    AS chapter_title,
+           chapter.subject_id
+    FROM questions q
+    JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
+    JOIN nodes concept  ON concept.node_id = qcm.concept_node_id
+    JOIN nodes subtopic ON subtopic.node_id = concept.parent_id
+    JOIN nodes topic    ON topic.node_id = subtopic.parent_id
+    JOIN nodes chapter  ON chapter.node_id = topic.parent_id
+    WHERE q.tenant_id = $1 AND q.status = 'published'
+),
+mine AS (
+    SELECT question_id,
+           COUNT(*)                       AS tries,
+           COUNT(*) FILTER (WHERE is_correct) AS hits,
+           BOOL_OR(is_correct)            AS ever_correct,
+           COALESCE(SUM(time_spent_ms), 0) AS ms
+    FROM attempts
+    WHERE firebase_uid = $2
+    GROUP BY question_id
+)
+SELECT s.subject_id, s.chapter_id, s.chapter_title,
+       COUNT(*)                                            AS total_questions,
+       COUNT(m.question_id)                                AS attempted_questions,
+       COUNT(m.question_id) FILTER (WHERE m.ever_correct)  AS solved_questions,
+       COALESCE(SUM(m.tries), 0)                           AS attempted,
+       COALESCE(SUM(m.hits), 0)                            AS correct,
+       COALESCE(SUM(m.ms), 0)                              AS time_spent_ms
+FROM scope s
+LEFT JOIN mine m ON m.question_id = s.question_id
+GROUP BY s.subject_id, s.chapter_id, s.chapter_title
+"""
+
+
 @router.get("/progress", response_model=ProgressSummary)
 async def get_progress(
     user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> ProgressSummary:
     """Everything the home screen and profile need, derived from the attempt log:
-    overall totals plus a breakdown by subject and by chapter."""
+    overall totals plus per-subject and per-chapter accuracy, time and coverage."""
     totals = await connection.fetchrow(
         """
         SELECT COUNT(*) AS attempted,
@@ -115,32 +157,7 @@ async def get_progress(
         user["uid"],
     )
 
-    # An attempt reaches its chapter through the concept it is tagged to, so walk
-    # concept -> subtopic -> topic -> chapter and roll up there.
-    rows = await connection.fetch(
-        """
-        WITH scoped AS (
-            SELECT DISTINCT ON (a.attempt_id)
-                   a.attempt_id, a.is_correct, a.time_spent_ms,
-                   n.subject_id, chapter.node_id AS chapter_id, chapter.title AS chapter_title
-            FROM attempts a
-            JOIN question_concept_mappings qcm ON qcm.question_id = a.question_id
-            JOIN nodes n       ON n.node_id = qcm.concept_node_id
-            JOIN nodes subtop  ON subtop.node_id = n.parent_id
-            JOIN nodes topic   ON topic.node_id = subtop.parent_id
-            JOIN nodes chapter ON chapter.node_id = topic.parent_id
-            WHERE a.firebase_uid = $1
-            ORDER BY a.attempt_id, qcm.is_primary DESC
-        )
-        SELECT subject_id, chapter_id, chapter_title,
-               COUNT(*) AS attempted,
-               COUNT(*) FILTER (WHERE is_correct) AS correct,
-               COALESCE(SUM(time_spent_ms), 0) AS time_spent_ms
-        FROM scoped
-        GROUP BY subject_id, chapter_id, chapter_title
-        """,
-        user["uid"],
-    )
+    rows = await connection.fetch(_SCOPE_PROGRESS_SQL, tenant, user["uid"])
 
     chapters = [
         ScopeProgress(
@@ -150,18 +167,22 @@ async def get_progress(
             correct=r["correct"],
             accuracy=_accuracy(r["correct"], r["attempted"]),
             time_spent_ms=r["time_spent_ms"],
+            total_questions=r["total_questions"],
+            attempted_questions=r["attempted_questions"],
+            solved_questions=r["solved_questions"],
         )
         for r in rows
     ]
 
     by_subject: dict[str, dict] = {}
     for r in rows:
-        bucket = by_subject.setdefault(
-            r["subject_id"], {"attempted": 0, "correct": 0, "time_spent_ms": 0}
+        b = by_subject.setdefault(
+            r["subject_id"],
+            {"attempted": 0, "correct": 0, "time_spent_ms": 0,
+             "total_questions": 0, "attempted_questions": 0, "solved_questions": 0},
         )
-        bucket["attempted"] += r["attempted"]
-        bucket["correct"] += r["correct"]
-        bucket["time_spent_ms"] += r["time_spent_ms"]
+        for field in b:
+            b[field] += r[field]
 
     subjects = [
         ScopeProgress(
@@ -171,6 +192,9 @@ async def get_progress(
             correct=v["correct"],
             accuracy=_accuracy(v["correct"], v["attempted"]),
             time_spent_ms=v["time_spent_ms"],
+            total_questions=v["total_questions"],
+            attempted_questions=v["attempted_questions"],
+            solved_questions=v["solved_questions"],
         )
         for subject_id, v in sorted(by_subject.items())
     ]
@@ -186,21 +210,63 @@ async def get_progress(
     )
 
 
-@router.get("/progress/chapters/{chapter_id}", response_model=list[ConceptProgress])
+@router.get("/progress/chapters/{chapter_id}", response_model=ChapterProgressDetail)
 async def get_chapter_progress(
     chapter_id: str,
     user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
-) -> list[ConceptProgress]:
-    """Per-concept accuracy inside one chapter. This is the shape weakness
-    detection and adaptive practice will read from."""
-    rows = await connection.fetch(
+) -> ChapterProgressDetail:
+    """One chapter broken down by topic (what the topic cards show) and by concept
+    (the shape weakness detection and adaptive practice will read).
+
+    Topic coverage is computed here rather than in the app because a question can
+    be tagged to several concepts under the same topic; counting it once needs a
+    DISTINCT the client cannot do without the mapping table.
+    """
+    topic_rows = await connection.fetch(
+        """
+        WITH topic_questions AS (
+            SELECT DISTINCT topic.node_id AS topic_id, topic.title AS topic_title,
+                   topic.display_order, q.question_id
+            FROM nodes topic
+            JOIN nodes subtopic ON subtopic.parent_id = topic.node_id
+            JOIN nodes concept  ON concept.parent_id = subtopic.node_id
+            JOIN question_concept_mappings qcm ON qcm.concept_node_id = concept.node_id
+            JOIN questions q ON q.question_id = qcm.question_id
+                            AND q.tenant_id = $1 AND q.status = 'published'
+            WHERE topic.parent_id = $2 AND topic.tenant_id = $1
+        ),
+        mine AS (
+            SELECT question_id,
+                   COUNT(*) AS tries,
+                   COUNT(*) FILTER (WHERE is_correct) AS hits,
+                   BOOL_OR(is_correct) AS ever_correct,
+                   COALESCE(SUM(time_spent_ms), 0) AS ms
+            FROM attempts WHERE firebase_uid = $3 GROUP BY question_id
+        )
+        SELECT tq.topic_id, tq.topic_title, tq.display_order,
+               COUNT(*) AS total_questions,
+               COUNT(m.question_id) AS attempted_questions,
+               COUNT(m.question_id) FILTER (WHERE m.ever_correct) AS solved_questions,
+               COALESCE(SUM(m.tries), 0) AS attempted,
+               COALESCE(SUM(m.hits), 0) AS correct,
+               COALESCE(SUM(m.ms), 0) AS time_spent_ms
+        FROM topic_questions tq
+        LEFT JOIN mine m ON m.question_id = tq.question_id
+        GROUP BY tq.topic_id, tq.topic_title, tq.display_order
+        ORDER BY tq.display_order, tq.topic_title
+        """,
+        tenant,
+        chapter_id,
+        user["uid"],
+    )
+
+    concept_rows = await connection.fetch(
         """
         WITH RECURSIVE descendants AS (
             SELECT node_id, type, title, parent_id
-            FROM nodes
-            WHERE tenant_id = $1 AND node_id = $2
+            FROM nodes WHERE tenant_id = $1 AND node_id = $2
             UNION ALL
             SELECT n.node_id, n.type, n.title, n.parent_id
             FROM nodes n JOIN descendants d ON n.parent_id = d.node_id
@@ -211,8 +277,7 @@ async def get_chapter_progress(
                COUNT(a.attempt_id) FILTER (WHERE a.is_correct) AS correct
         FROM descendants d
         LEFT JOIN question_concept_mappings qcm ON qcm.concept_node_id = d.node_id
-        LEFT JOIN attempts a
-               ON a.question_id = qcm.question_id AND a.firebase_uid = $3
+        LEFT JOIN attempts a ON a.question_id = qcm.question_id AND a.firebase_uid = $3
         WHERE d.type = 'concept'
         GROUP BY d.node_id, d.title
         ORDER BY d.node_id
@@ -221,13 +286,57 @@ async def get_chapter_progress(
         chapter_id,
         user["uid"],
     )
-    return [
-        ConceptProgress(
-            node_id=r["node_id"],
-            title=r["title"],
+
+    topics = [
+        ScopeProgress(
+            node_id=r["topic_id"],
+            title=r["topic_title"],
             attempted=r["attempted"],
             correct=r["correct"],
             accuracy=_accuracy(r["correct"], r["attempted"]),
+            time_spent_ms=r["time_spent_ms"],
+            total_questions=r["total_questions"],
+            attempted_questions=r["attempted_questions"],
+            solved_questions=r["solved_questions"],
         )
-        for r in rows
+        for r in topic_rows
     ]
+
+    # Deliberately NOT the sum of the topics: a question tagged under two topics
+    # counts once per topic (correct for topic coverage) but must count once for
+    # the chapter, or this endpoint would contradict /progress.
+    chapter_row = await connection.fetchrow(
+        _SCOPE_PROGRESS_SQL + " HAVING s.chapter_id = $3",
+        tenant,
+        user["uid"],
+        chapter_id,
+    )
+    chapter = ScopeProgress(
+        node_id=chapter_id,
+        title=chapter_row["chapter_title"] if chapter_row else "",
+        attempted=chapter_row["attempted"] if chapter_row else 0,
+        correct=chapter_row["correct"] if chapter_row else 0,
+        accuracy=_accuracy(
+            chapter_row["correct"] if chapter_row else 0,
+            chapter_row["attempted"] if chapter_row else 0,
+        ),
+        time_spent_ms=chapter_row["time_spent_ms"] if chapter_row else 0,
+        total_questions=chapter_row["total_questions"] if chapter_row else 0,
+        attempted_questions=chapter_row["attempted_questions"] if chapter_row else 0,
+        solved_questions=chapter_row["solved_questions"] if chapter_row else 0,
+    )
+
+    return ChapterProgressDetail(
+        chapter=chapter,
+        topics=topics,
+        concepts=[
+            ConceptProgress(
+                node_id=r["node_id"],
+                title=r["title"],
+                attempted=r["attempted"],
+                correct=r["correct"],
+                accuracy=_accuracy(r["correct"], r["attempted"]),
+            )
+            for r in concept_rows
+        ],
+    )
