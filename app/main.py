@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from app import db
 from app.auth import init_firebase
-from app.routers import auth, content, health
+from app.routers import attempts, auth, content, health
 
 
 @asynccontextmanager
@@ -20,3 +20,4 @@ app = FastAPI(title="Jeene Backend", lifespan=lifespan)
 app.include_router(health.router)
 app.include_router(content.router)
 app.include_router(auth.router)
+app.include_router(attempts.router)
