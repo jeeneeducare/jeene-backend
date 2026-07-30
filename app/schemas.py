@@ -136,6 +136,8 @@ class ScopeProgress(BaseModel):
 class ChapterProgressDetail(BaseModel):
     chapter: ScopeProgress
     topics: list[ScopeProgress] = []
+    # One level below topics: what the subtopic tree screen shows.
+    subtopics: list[ScopeProgress] = []
     concepts: list[ConceptProgress] = []
 
 

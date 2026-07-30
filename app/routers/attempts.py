@@ -210,6 +210,77 @@ async def get_progress(
     )
 
 
+# A scope's questions reached through the tree. Topics sit two hops above concepts,
+# subtopics one — otherwise the roll-up is identical, so it is written once.
+_TOPIC_SCOPE = """
+    FROM nodes scope
+    JOIN nodes subtopic ON subtopic.parent_id = scope.node_id
+    JOIN nodes concept  ON concept.parent_id = subtopic.node_id
+    JOIN question_concept_mappings qcm ON qcm.concept_node_id = concept.node_id
+    JOIN questions q ON q.question_id = qcm.question_id
+                    AND q.tenant_id = $1 AND q.status = 'published'
+    WHERE scope.parent_id = $2 AND scope.tenant_id = $1
+"""
+
+_SUBTOPIC_SCOPE = """
+    FROM nodes scope
+    JOIN nodes concept ON concept.parent_id = scope.node_id
+    JOIN question_concept_mappings qcm ON qcm.concept_node_id = concept.node_id
+    JOIN questions q ON q.question_id = qcm.question_id
+                    AND q.tenant_id = $1 AND q.status = 'published'
+    JOIN nodes topic ON topic.node_id = scope.parent_id
+    WHERE topic.parent_id = $2 AND scope.tenant_id = $1
+"""
+
+
+def _scope_level_sql(scope_join: str) -> str:
+    """Coverage and accuracy for every node at one level of a chapter.
+
+    DISTINCT on (scope, question) matters: a question tagged to several concepts under
+    the same scope must count once, which is a dedup the client cannot do.
+    """
+    return f"""
+        WITH scope_questions AS (
+            SELECT DISTINCT scope.node_id AS scope_id, scope.title AS scope_title,
+                   scope.display_order, q.question_id
+            {scope_join}
+        ),
+        mine AS (
+            SELECT question_id,
+                   COUNT(*) AS tries,
+                   COUNT(*) FILTER (WHERE is_correct) AS hits,
+                   BOOL_OR(is_correct) AS ever_correct,
+                   COALESCE(SUM(time_spent_ms), 0) AS ms
+            FROM attempts WHERE firebase_uid = $3 GROUP BY question_id
+        )
+        SELECT sq.scope_id, sq.scope_title, sq.display_order,
+               COUNT(*) AS total_questions,
+               COUNT(m.question_id) AS attempted_questions,
+               COUNT(m.question_id) FILTER (WHERE m.ever_correct) AS solved_questions,
+               COALESCE(SUM(m.tries), 0) AS attempted,
+               COALESCE(SUM(m.hits), 0) AS correct,
+               COALESCE(SUM(m.ms), 0) AS time_spent_ms
+        FROM scope_questions sq
+        LEFT JOIN mine m ON m.question_id = sq.question_id
+        GROUP BY sq.scope_id, sq.scope_title, sq.display_order
+        ORDER BY sq.display_order, sq.scope_title
+    """
+
+
+def _scope_progress(row: asyncpg.Record) -> ScopeProgress:
+    return ScopeProgress(
+        node_id=row["scope_id"],
+        title=row["scope_title"],
+        attempted=row["attempted"],
+        correct=row["correct"],
+        accuracy=_accuracy(row["correct"], row["attempted"]),
+        time_spent_ms=row["time_spent_ms"],
+        total_questions=row["total_questions"],
+        attempted_questions=row["attempted_questions"],
+        solved_questions=row["solved_questions"],
+    )
+
+
 @router.get("/progress/chapters/{chapter_id}", response_model=ChapterProgressDetail)
 async def get_chapter_progress(
     chapter_id: str,
@@ -225,41 +296,12 @@ async def get_chapter_progress(
     DISTINCT the client cannot do without the mapping table.
     """
     topic_rows = await connection.fetch(
-        """
-        WITH topic_questions AS (
-            SELECT DISTINCT topic.node_id AS topic_id, topic.title AS topic_title,
-                   topic.display_order, q.question_id
-            FROM nodes topic
-            JOIN nodes subtopic ON subtopic.parent_id = topic.node_id
-            JOIN nodes concept  ON concept.parent_id = subtopic.node_id
-            JOIN question_concept_mappings qcm ON qcm.concept_node_id = concept.node_id
-            JOIN questions q ON q.question_id = qcm.question_id
-                            AND q.tenant_id = $1 AND q.status = 'published'
-            WHERE topic.parent_id = $2 AND topic.tenant_id = $1
-        ),
-        mine AS (
-            SELECT question_id,
-                   COUNT(*) AS tries,
-                   COUNT(*) FILTER (WHERE is_correct) AS hits,
-                   BOOL_OR(is_correct) AS ever_correct,
-                   COALESCE(SUM(time_spent_ms), 0) AS ms
-            FROM attempts WHERE firebase_uid = $3 GROUP BY question_id
-        )
-        SELECT tq.topic_id, tq.topic_title, tq.display_order,
-               COUNT(*) AS total_questions,
-               COUNT(m.question_id) AS attempted_questions,
-               COUNT(m.question_id) FILTER (WHERE m.ever_correct) AS solved_questions,
-               COALESCE(SUM(m.tries), 0) AS attempted,
-               COALESCE(SUM(m.hits), 0) AS correct,
-               COALESCE(SUM(m.ms), 0) AS time_spent_ms
-        FROM topic_questions tq
-        LEFT JOIN mine m ON m.question_id = tq.question_id
-        GROUP BY tq.topic_id, tq.topic_title, tq.display_order
-        ORDER BY tq.display_order, tq.topic_title
-        """,
-        tenant,
-        chapter_id,
-        user["uid"],
+        _scope_level_sql(_TOPIC_SCOPE), tenant, chapter_id, user["uid"]
+    )
+    # One level deeper. The subtopic tree screen shows coverage per subtopic, so the
+    # same roll-up runs with concepts one hop closer to the scope.
+    subtopic_rows = await connection.fetch(
+        _scope_level_sql(_SUBTOPIC_SCOPE), tenant, chapter_id, user["uid"]
     )
 
     concept_rows = await connection.fetch(
@@ -287,20 +329,8 @@ async def get_chapter_progress(
         user["uid"],
     )
 
-    topics = [
-        ScopeProgress(
-            node_id=r["topic_id"],
-            title=r["topic_title"],
-            attempted=r["attempted"],
-            correct=r["correct"],
-            accuracy=_accuracy(r["correct"], r["attempted"]),
-            time_spent_ms=r["time_spent_ms"],
-            total_questions=r["total_questions"],
-            attempted_questions=r["attempted_questions"],
-            solved_questions=r["solved_questions"],
-        )
-        for r in topic_rows
-    ]
+    topics = [_scope_progress(r) for r in topic_rows]
+    subtopics = [_scope_progress(r) for r in subtopic_rows]
 
     # Deliberately NOT the sum of the topics: a question tagged under two topics
     # counts once per topic (correct for topic coverage) but must count once for
@@ -329,6 +359,7 @@ async def get_chapter_progress(
     return ChapterProgressDetail(
         chapter=chapter,
         topics=topics,
+        subtopics=subtopics,
         concepts=[
             ConceptProgress(
                 node_id=r["node_id"],
