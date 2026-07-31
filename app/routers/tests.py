@@ -132,7 +132,13 @@ async def _paper_for(connection, test_id: str, tenant: str) -> list[dict]:
     paper = [dict(r) for r in rows]
     figures = await _figures_for(connection, [r["question_id"] for r in paper])
     for question in paper:
-        question["figures"] = figures.get(question["question_id"], [])
+        # Stem and option diagrams only. A worked solution's figure is part of the
+        # answer, and the paper must not carry any part of the answer: one of test
+        # 15's questions is answered by the very diagram its solution draws.
+        question["figures"] = [
+            f for f in figures.get(question["question_id"], [])
+            if f.placement != "explanation"
+        ]
     return paper
 
 
