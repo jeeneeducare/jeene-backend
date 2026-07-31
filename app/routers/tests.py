@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
 from app.schemas import (
+    QuestionFigure,
+    QuestionResult,
     TestPaper,
     TestSession,
     TestSessionResult,
@@ -127,7 +129,36 @@ async def _paper_for(connection, test_id: str, tenant: str) -> list[dict]:
         test_id,
         tenant,
     )
-    return [dict(r) for r in rows]
+    paper = [dict(r) for r in rows]
+    figures = await _figures_for(connection, [r["question_id"] for r in paper])
+    for question in paper:
+        question["figures"] = figures.get(question["question_id"], [])
+    return paper
+
+
+async def _figures_for(connection, question_ids: list[str]) -> dict[str, list[QuestionFigure]]:
+    """Diagrams by question id. A question that references a figure it cannot show is
+    unanswerable, so these travel with the paper rather than being fetched per question."""
+    if not question_ids:
+        return {}
+    rows = await connection.fetch(
+        """
+        SELECT question_id, image_url, placement, option_id, caption
+        FROM question_figures
+        WHERE question_id = ANY($1::text[])
+        ORDER BY question_id, display_order
+        """,
+        question_ids,
+    )
+    figures: dict[str, list[QuestionFigure]] = {}
+    for r in rows:
+        figures.setdefault(r["question_id"], []).append(
+            QuestionFigure(
+                image_url=r["image_url"], placement=r["placement"],
+                option_id=r["option_id"], caption=r["caption"],
+            )
+        )
+    return figures
 
 
 @router.post("/tests/{test_id}/sessions", response_model=TestSession)
@@ -236,6 +267,7 @@ async def _session_payload(connection, session, test) -> TestSession:
                 question_text=p["question_text"],
                 options=p["options_json"],
                 difficulty=p["difficulty"],
+                figures=p["figures"],
             )
             for p in paper
         ],
@@ -329,7 +361,7 @@ async def submit_session(
     session = await _authorized_session(connection, session_id, user, x_test_token)
 
     test = await connection.fetchrow(
-        "SELECT test_id, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
+        "SELECT test_id, title, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
     )
     total = await connection.fetchval(
@@ -402,7 +434,100 @@ async def submit_session(
         skipped_count=skipped,
         score=score,
         max_score=(total or 0) * test["marks_correct"],
+        title=test["title"],
+        marks_correct=test["marks_correct"],
+        marks_wrong=test["marks_wrong"],
+        review=await _review_for(connection, session, updated["submitted_at"]),
     )
+
+
+@router.get("/tests/sessions/{session_id}/result", response_model=TestSessionResult)
+async def session_result(
+    session_id: str,
+    user: dict | None = Depends(optional_user),
+    x_test_token: str | None = Header(default=None),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> TestSessionResult:
+    """The score card for a sitting that has already been submitted.
+
+    Submission itself returns this, but a browser refresh on the score page would
+    otherwise lose it, and re-submitting to get it back reads like a mistake.
+    """
+    session = await _authorized_session(connection, session_id, user, x_test_token)
+    if session["submitted_at"] is None:
+        raise HTTPException(status_code=409, detail="This paper has not been submitted yet")
+
+    test = await connection.fetchrow(
+        "SELECT title, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
+        session["test_id"],
+    )
+    total = await connection.fetchval(
+        "SELECT COUNT(*) FROM test_questions WHERE test_id = $1", session["test_id"]
+    )
+    return TestSessionResult(
+        session_id=session_id,
+        test_id=session["test_id"],
+        submitted_at=session["submitted_at"],
+        total_questions=total or 0,
+        correct_count=session["correct_count"] or 0,
+        wrong_count=session["wrong_count"] or 0,
+        skipped_count=session["skipped_count"] or 0,
+        score=float(session["score"] or 0),
+        max_score=(total or 0) * test["marks_correct"],
+        title=test["title"],
+        marks_correct=test["marks_correct"],
+        marks_wrong=test["marks_wrong"],
+        review=await _review_for(connection, session, session["submitted_at"]),
+    )
+
+
+async def _review_for(connection, session, submitted_at) -> list[QuestionResult]:
+    """The paper with the key alongside what the student chose.
+
+    Only called once a sitting is submitted. That is the whole safety argument: before
+    submission this data does not leave the server, and afterwards there is nothing
+    left to protect.
+    """
+    if submitted_at is None:
+        return []
+
+    rows = await connection.fetch(
+        """
+        SELECT tq.position, q.question_id, q.question_text, q.options_json,
+               q.correct_option_ids, q.explanation_json,
+               r.selected_option_ids, a.is_correct
+        FROM test_questions tq
+        JOIN questions q ON q.question_id = tq.question_id
+        LEFT JOIN test_responses r
+               ON r.question_id = q.question_id AND r.session_id = $2::uuid
+        LEFT JOIN attempts a
+               ON a.question_id = q.question_id AND a.session_id = $2::uuid
+        WHERE tq.test_id = $1 AND q.tenant_id = $3
+        ORDER BY tq.position
+        """,
+        session["test_id"], str(session["session_id"]), session["tenant_id"],
+    )
+    figures = await _figures_for(connection, [r["question_id"] for r in rows])
+
+    review = []
+    for r in rows:
+        chosen = list(r["selected_option_ids"] or [])
+        explanation = r["explanation_json"] or {}
+        review.append(
+            QuestionResult(
+                position=r["position"],
+                question_id=r["question_id"],
+                question_text=r["question_text"],
+                options=r["options_json"],
+                figures=figures.get(r["question_id"], []),
+                selected_option_ids=chosen,
+                correct_option_ids=list(r["correct_option_ids"] or []),
+                explanation=explanation.get("text") if isinstance(explanation, dict) else None,
+                # Unanswered is its own outcome, not a wrong answer: it costs no marks.
+                status="skipped" if not chosen else ("correct" if r["is_correct"] else "wrong"),
+            )
+        )
+    return review
 
 
 def _grade_response(row) -> bool:

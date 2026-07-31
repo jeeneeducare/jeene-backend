@@ -185,6 +185,8 @@ class TestPaper(BaseModel):
     question_text: str
     options: list[dict[str, Any]] | None = None
     difficulty: str | None = None
+    # Some questions are unanswerable without their diagram, so the paper carries them.
+    figures: list[QuestionFigure] = []
 
 
 class TestSession(BaseModel):
@@ -207,6 +209,24 @@ class TestSession(BaseModel):
     paper: list[TestPaper] = []
 
 
+class QuestionResult(BaseModel):
+    """One row of the post-submission review.
+
+    Only ever built for a submitted sitting, which is what makes it safe to carry the
+    key and the worked solution: the paper is over.
+    """
+    position: int
+    question_id: str
+    question_text: str
+    options: list[dict[str, Any]] | None = None
+    figures: list[QuestionFigure] = []
+    selected_option_ids: list[str] = []
+    correct_option_ids: list[str] = []
+    explanation: str | None = None
+    # 'correct' | 'wrong' | 'skipped'
+    status: str
+
+
 class TestSessionResult(BaseModel):
     session_id: str
     test_id: str
@@ -217,3 +237,7 @@ class TestSessionResult(BaseModel):
     skipped_count: int
     score: float
     max_score: float
+    title: str | None = None
+    marks_correct: int = 4
+    marks_wrong: int = 1
+    review: list[QuestionResult] = []
