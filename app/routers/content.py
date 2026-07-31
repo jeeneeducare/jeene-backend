@@ -14,6 +14,20 @@ from app.schemas import (
 )
 
 router = APIRouter()
+# A question that arrived with a test paper stays out of ordinary browsing until a
+# test containing it has been released, so a student cannot meet a paper's questions
+# in practice before sitting it.
+#
+# Keyed on the question's own source, NOT merely on membership of an unreleased test.
+# A generated paper draws on questions that already live in the bank, and putting one
+# of those into an unreleased test must not pull it out of practice — only questions
+# that ARRIVED with a paper are gated.
+_NOT_UNRELEASED_TEST = """
+  AND (q.source <> 'test_paper' OR EXISTS (
+        SELECT 1 FROM test_questions tq
+        JOIN tests t ON t.test_id = tq.test_id
+        WHERE tq.question_id = q.question_id AND t.released_at IS NOT NULL))
+"""
 
 
 @router.get("/chapters", response_model=list[Chapter])
@@ -112,7 +126,7 @@ async def get_question(
                  WHERE m.question_id = q.question_id) AS concept_ids
         FROM questions q
         WHERE q.tenant_id = $1 AND q.question_id = $2 AND q.status = 'published'
-        """,
+        """ + _NOT_UNRELEASED_TEST,
         tenant,
         question_id,
     )
@@ -130,10 +144,10 @@ async def get_question_answer(
 ) -> QuestionAnswer:
     row = await connection.fetchrow(
         """
-        SELECT question_id, correct_option_ids, explanation_json
-        FROM questions
-        WHERE tenant_id = $1 AND question_id = $2 AND status = 'published'
-        """,
+        SELECT q.question_id, q.correct_option_ids, q.explanation_json
+        FROM questions q
+        WHERE q.tenant_id = $1 AND q.question_id = $2 AND q.status = 'published'
+        """ + _NOT_UNRELEASED_TEST,
         tenant,
         question_id,
     )
@@ -206,7 +220,7 @@ async def _paginated_questions_for_node_ids(
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
-        """,
+        """ + _NOT_UNRELEASED_TEST,
         tenant,
         node_ids,
     )
@@ -219,6 +233,7 @@ async def _paginated_questions_for_node_ids(
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
+        """ + _NOT_UNRELEASED_TEST + """
         ORDER BY q.question_id
         LIMIT $3 OFFSET $4
         """,
