@@ -89,12 +89,41 @@ CREATE TABLE IF NOT EXISTS test_sessions (
   wrong_count   INTEGER,
   skipped_count INTEGER,
 
-  -- Per-question review flags. These are presentation state, not answers, so they
-  -- live here rather than polluting the attempt log.
-  marked_for_review TEXT[] NOT NULL DEFAULT '{}',
-
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_test_sessions_user ON test_sessions (firebase_uid, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_test_sessions_test ON test_sessions (test_id);
+
+-- The answer sheet for one sitting: what the student has filled in so far.
+--
+-- Deliberately NOT the attempt log. During a test an answer is a draft the student
+-- may change any number of times, and recording each change as an attempt would
+-- corrupt the very analytics the log exists for: revise A -> B -> C and a question
+-- you finally got right reads as two wrong answers and one correct, so a careful
+-- student scores worse than a lucky one and weakness detection flags concepts they
+-- actually know. It would also creep their progress rings upward mid-paper.
+--
+-- So the sheet is updated in place while sitting, and at submission the final state
+-- of each question becomes exactly one graded attempt.
+CREATE TABLE IF NOT EXISTS test_responses (
+  session_id        UUID NOT NULL REFERENCES test_sessions(session_id) ON DELETE CASCADE,
+  question_id       TEXT NOT NULL REFERENCES questions(question_id),
+
+  selected_option_ids TEXT[],
+  numeric_answer      NUMERIC,
+  -- Presentation state, kept with the response so it survives a device change.
+  marked_for_review   BOOLEAN NOT NULL DEFAULT false,
+  -- How often the student changed their mind here. Genuine evidence of shakiness,
+  -- recorded without letting it distort accuracy.
+  revision_count      INTEGER NOT NULL DEFAULT 0,
+
+  first_answered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Time on this question accumulates across visits.
+  time_spent_ms     INTEGER NOT NULL DEFAULT 0,
+
+  PRIMARY KEY (session_id, question_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_responses_session ON test_responses (session_id);
