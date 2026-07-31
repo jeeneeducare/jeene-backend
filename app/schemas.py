@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -245,3 +245,73 @@ class TestSessionResult(BaseModel):
     marks_correct: int = 4
     marks_wrong: int = 1
     review: list[QuestionResult] = []
+
+# --- Reports ---------------------------------------------------------------------
+#
+# One payload per screen rather than per card: the analytics screen is a single scroll,
+# so it should cost a single round trip, and every number on it comes from the same
+# attempt log at the same instant. Split across calls they could disagree.
+
+
+class DayStudy(BaseModel):
+    """One bar of the study-time chart. `day` is an IST date, not UTC."""
+    day: date
+    label: str
+    minutes: int
+    questions: int
+
+
+class HourAccuracy(BaseModel):
+    """Accuracy in one hour of the IST clock, for "when do you work best"."""
+    hour: int
+    attempted: int
+    correct: int
+    accuracy: float
+
+
+class SubjectSlice(BaseModel):
+    subject_id: str
+    title: str
+    attempted: int
+    correct: int
+    accuracy: float
+    minutes: int
+    total_questions: int
+    attempted_questions: int
+    solved_questions: int
+    coverage: float
+
+
+class StreakInfo(BaseModel):
+    """Days in a row meeting the daily bar, which is minutes studied, not questions."""
+    current: int
+    longest: int
+    minutes_today: int
+    goal_minutes: int
+    met_today: bool
+
+
+class ReportSummary(BaseModel):
+    period: str
+    # Absent until there is a previous period to compare with; the client hides the
+    # delta rather than showing a number it cannot justify.
+    since: datetime | None = None
+    attempted: int
+    correct: int
+    wrong: int
+    accuracy: float
+    distinct_questions: int
+    minutes: int
+    pyq_attempted: int
+    pyq_correct: int
+    total_questions: int
+    solved_questions: int
+    coverage: float
+    subjects: list[SubjectSlice] = []
+    by_day: list[DayStudy] = []
+    by_hour: list[HourAccuracy] = []
+    streak: StreakInfo
+    # Same figures for the period before this one, when one exists. Null means the
+    # student has no history yet, and the screen shows no comparison at all.
+    previous_attempted: int | None = None
+    previous_minutes: int | None = None
