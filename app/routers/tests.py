@@ -26,11 +26,17 @@ def _new_handoff_code() -> str:
 
 @router.get("/tests", response_model=list[TestSummary])
 async def list_tests(
+    user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[TestSummary]:
     """Papers a student can sit. Only published ones, and only those that actually
-    have questions — an empty paper is worse than no paper."""
+    have questions — an empty paper is worse than no paper.
+
+    Signed in only. Sitting a paper is account-bound, so listing should be too, and
+    a coaching's test series is theirs: with the tenant taken from the caller's token,
+    an anonymous request would otherwise read the default tenant's papers.
+    """
     rows = await connection.fetch(
         """
         SELECT t.test_id, t.title, t.exam, t.class_levels, t.duration_minutes,
