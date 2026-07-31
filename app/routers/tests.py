@@ -148,14 +148,13 @@ async def _session_payload(connection, session, test, tenant) -> TestSession:
     """A session plus everything a client needs to render or resume it."""
     paper = await _paper_for(connection, session["test_id"], tenant)
 
-    # Responses already recorded for this sitting, so a refresh or a move from phone
-    # to browser resumes rather than starting over.
+    # The answer sheet, so a refresh or a move from phone to browser resumes rather
+    # than starting over. Reading the sheet, not the attempt log: nothing is graded
+    # until submission.
     saved = await connection.fetch(
         """
-        SELECT DISTINCT ON (question_id) question_id, selected_option_ids
-        FROM attempts
-        WHERE session_id = $1
-        ORDER BY question_id, created_at DESC
+        SELECT question_id, selected_option_ids, marked_for_review
+        FROM test_responses WHERE session_id = $1
         """,
         session["session_id"],
     )
@@ -170,8 +169,11 @@ async def _session_payload(connection, session, test, tenant) -> TestSession:
         duration_minutes=test["duration_minutes"],
         marks_correct=test["marks_correct"],
         marks_wrong=test["marks_wrong"],
-        marked_for_review=list(session["marked_for_review"] or []),
-        responses={r["question_id"]: list(r["selected_option_ids"] or []) for r in saved},
+        marked_for_review=[r["question_id"] for r in saved if r["marked_for_review"]],
+        responses={
+            r["question_id"]: list(r["selected_option_ids"] or [])
+            for r in saved if r["selected_option_ids"]
+        },
         paper=[
             TestPaper(
                 position=p["position"],
@@ -242,47 +244,76 @@ async def claim_handoff(
 async def submit_session(
     session_id: str,
     user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSessionResult:
-    """Finish a sitting and score it.
+    """Finish a sitting: grade the answer sheet and score it.
 
-    The score is computed from the recorded attempts and the paper's own marking
-    scheme, never from anything the client sends, so phone and browser always agree
-    and a client cannot report its own result.
+    This is where the paper becomes attempts — exactly one per answered question,
+    graded server-side against the hidden key. One per question is the point: the
+    student may have changed an answer five times, but they answered the question
+    once, and the attempt log has to say so or every derived number is wrong.
+
+    Idempotent. Submitting twice returns the same result rather than double-recording,
+    since a flaky network on the last tap of a three-hour paper must not cost marks.
     """
     session = await connection.fetchrow(
         "SELECT * FROM test_sessions WHERE session_id = $1::uuid AND firebase_uid = $2",
-        session_id,
-        user["uid"],
+        session_id, user["uid"],
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
     test = await connection.fetchrow(
-        "SELECT marks_correct, marks_wrong FROM tests WHERE test_id = $1",
+        "SELECT test_id, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
     )
-    totals = await connection.fetchrow(
-        """
-        WITH latest AS (
-            SELECT DISTINCT ON (a.question_id) a.question_id, a.is_correct
-            FROM attempts a
-            WHERE a.session_id = $1::uuid
-            ORDER BY a.question_id, a.created_at DESC
+    total = await connection.fetchval(
+        "SELECT COUNT(*) FROM test_questions WHERE test_id = $1", session["test_id"]
+    )
+
+    if session["submitted_at"] is None:
+        responses = await connection.fetch(
+            """
+            SELECT r.question_id, r.selected_option_ids, r.numeric_answer, r.time_spent_ms,
+                   q.question_type, q.correct_option_ids,
+                   q.numerical_answer, q.numerical_tolerance
+            FROM test_responses r
+            JOIN questions q ON q.question_id = r.question_id
+            WHERE r.session_id = $1::uuid
+              AND (r.selected_option_ids IS NOT NULL OR r.numeric_answer IS NOT NULL)
+            """,
+            session_id,
         )
-        SELECT
-            (SELECT COUNT(*) FROM test_questions WHERE test_id = $2) AS total,
-            COUNT(*) FILTER (WHERE is_correct) AS correct,
-            COUNT(*) FILTER (WHERE NOT is_correct) AS wrong
-        FROM latest
+        for r in responses:
+            is_correct = _grade_response(r)
+            # A deterministic attempt id per (session, question) makes the whole
+            # submission idempotent: a retry collides and does nothing.
+            attempt_id = uuid.uuid5(uuid.UUID(str(session["session_id"])), r["question_id"])
+            await connection.execute(
+                """
+                INSERT INTO attempts (attempt_id, firebase_uid, tenant_id, question_id,
+                                      session_id, selected_option_ids, numeric_answer,
+                                      is_correct, time_spent_ms, solution_revealed)
+                VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, $8, $9, false)
+                ON CONFLICT (attempt_id) DO NOTHING
+                """,
+                attempt_id, user["uid"], tenant, r["question_id"], session_id,
+                list(r["selected_option_ids"] or []) or None, r["numeric_answer"],
+                is_correct, r["time_spent_ms"],
+            )
+
+    counts = await connection.fetchrow(
+        """
+        SELECT COUNT(*) FILTER (WHERE is_correct) AS correct,
+               COUNT(*) FILTER (WHERE NOT is_correct) AS wrong
+        FROM attempts WHERE session_id = $1::uuid
         """,
         session_id,
-        session["test_id"],
     )
-    correct = totals["correct"] or 0
-    wrong = totals["wrong"] or 0
-    total = totals["total"] or 0
-    skipped = max(total - correct - wrong, 0)
+    correct = counts["correct"] or 0
+    wrong = counts["wrong"] or 0
+    skipped = max((total or 0) - correct - wrong, 0)
     score = correct * test["marks_correct"] - wrong * test["marks_wrong"]
 
     updated = await connection.fetchrow(
@@ -300,36 +331,90 @@ async def submit_session(
         session_id=session_id,
         test_id=session["test_id"],
         submitted_at=updated["submitted_at"],
-        total_questions=total,
+        total_questions=total or 0,
         correct_count=correct,
         wrong_count=wrong,
         skipped_count=skipped,
         score=score,
-        max_score=total * test["marks_correct"],
+        max_score=(total or 0) * test["marks_correct"],
     )
 
 
-@router.put("/tests/sessions/{session_id}/review", response_model=TestSession)
-async def set_review_flags(
+def _grade_response(row) -> bool:
+    """Same rule the practice path uses: numericals within tolerance, everything else
+    an order-insensitive comparison of the chosen options to the key."""
+    if row["question_type"] == "numerical":
+        expected, given = row["numerical_answer"], row["numeric_answer"]
+        if expected is None or given is None:
+            return False
+        return abs(float(given) - float(expected)) <= float(row["numerical_tolerance"] or 0)
+    key = set(row["correct_option_ids"] or [])
+    return bool(key) and set(row["selected_option_ids"] or []) == key
+
+
+@router.put("/tests/sessions/{session_id}/responses/{question_id}", response_model=TestSession)
+async def save_response(
     payload: dict,
     session_id: str,
+    question_id: str,
     user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSession:
-    """Persist which questions are marked for review, so the palette survives a move
-    between devices. These are presentation flags, not answers."""
-    marked = [str(q) for q in (payload.get("marked_for_review") or [])]
+    """Write one answer onto the sheet. Nothing is graded here.
+
+    An answer during a test is a draft: the student may change it as often as they
+    like, and only the final state is scored. Grading each save would record several
+    attempts for one question, so revising A -> B -> C would read as two wrong answers
+    and one right, making a careful student look worse than a lucky one and pushing
+    weakness detection at concepts they actually know.
+
+    Sending `selected_option_ids: []` clears the answer, which is the CBT's Clear.
+    """
     session = await connection.fetchrow(
         """
-        UPDATE test_sessions SET marked_for_review = $3
+        SELECT * FROM test_sessions
         WHERE session_id = $1::uuid AND firebase_uid = $2
-        RETURNING *
         """,
-        session_id, user["uid"], marked,
+        session_id, user["uid"],
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    if session["submitted_at"] is not None:
+        raise HTTPException(status_code=409, detail="That test has already been submitted")
+    if session["expires_at"] <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="That test's time is up")
+
+    belongs = await connection.fetchval(
+        "SELECT 1 FROM test_questions WHERE test_id = $1 AND question_id = $2",
+        session["test_id"], question_id,
+    )
+    if not belongs:
+        raise HTTPException(status_code=404, detail="That question is not in this paper")
+
+    selected = [str(o) for o in (payload.get("selected_option_ids") or [])]
+    await connection.execute(
+        """
+        INSERT INTO test_responses (session_id, question_id, selected_option_ids,
+                                    numeric_answer, marked_for_review, time_spent_ms)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6)
+        ON CONFLICT (session_id, question_id) DO UPDATE SET
+            selected_option_ids = EXCLUDED.selected_option_ids,
+            numeric_answer = EXCLUDED.numeric_answer,
+            marked_for_review = EXCLUDED.marked_for_review,
+            -- Count a genuine change of mind, not a re-save of the same answer.
+            revision_count = test_responses.revision_count
+                + CASE WHEN test_responses.selected_option_ids IS DISTINCT FROM EXCLUDED.selected_option_ids
+                       THEN 1 ELSE 0 END,
+            time_spent_ms = test_responses.time_spent_ms + EXCLUDED.time_spent_ms,
+            updated_at = now()
+        """,
+        session_id, question_id, selected or None,
+        payload.get("numeric_answer"),
+        bool(payload.get("marked_for_review", False)),
+        int(payload.get("time_spent_ms") or 0),
+    )
+
     test = await connection.fetchrow(
         "SELECT test_id, title, duration_minutes, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
