@@ -231,6 +231,9 @@ async def _session_payload(connection, session, test) -> TestSession:
     tenant is the one that decides which paper it is.
     """
     paper = await _paper_for(connection, session["test_id"], session["tenant_id"])
+    candidate = await connection.fetchval(
+        "SELECT display_name FROM users WHERE firebase_uid = $1", session["firebase_uid"]
+    )
 
     # The answer sheet, so a refresh or a move from phone to browser resumes rather
     # than starting over. Reading the sheet, not the attempt log: nothing is graded
@@ -246,6 +249,7 @@ async def _session_payload(connection, session, test) -> TestSession:
         session_id=str(session["session_id"]),
         test_id=session["test_id"],
         title=test["title"],
+        candidate_name=candidate,
         handoff_code=session["handoff_code"],
         started_at=session["started_at"],
         expires_at=session["expires_at"],
@@ -493,7 +497,7 @@ async def _review_for(connection, session, submitted_at) -> list[QuestionResult]
 
     rows = await connection.fetch(
         """
-        SELECT tq.position, q.question_id, q.question_text, q.options_json,
+        SELECT tq.position, tq.section, q.question_id, q.question_text, q.options_json,
                q.correct_option_ids, q.explanation_json,
                r.selected_option_ids, a.is_correct
         FROM test_questions tq
@@ -516,6 +520,7 @@ async def _review_for(connection, session, submitted_at) -> list[QuestionResult]
         review.append(
             QuestionResult(
                 position=r["position"],
+                section=r["section"],
                 question_id=r["question_id"],
                 question_text=r["question_text"],
                 options=r["options_json"],

@@ -196,6 +196,9 @@ class TestSession(BaseModel):
     web_token: str | None = None
     test_id: str
     title: str
+    # The student sitting the paper. The browser has no account of its own, so the name
+    # on the CBT band has to come with the sitting.
+    candidate_name: str | None = None
     handoff_code: str | None = None
     started_at: datetime
     expires_at: datetime
@@ -216,6 +219,7 @@ class QuestionResult(BaseModel):
     key and the worked solution: the paper is over.
     """
     position: int
+    section: str | None = None
     question_id: str
     question_text: str
     options: list[dict[str, Any]] | None = None
