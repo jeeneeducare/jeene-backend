@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -162,3 +163,54 @@ class UserProfile(BaseModel):
     auth_provider: str | None
     photo_url: str | None
     is_new: bool = False
+
+
+class TestSummary(BaseModel):
+    test_id: str
+    title: str
+    exam: str | None = None
+    class_levels: list[int] = []
+    duration_minutes: int | None = None
+    marks_correct: int = 4
+    marks_wrong: int = 1
+    question_count: int = 0
+
+
+class TestPaper(BaseModel):
+    """A question as it appears in a paper. Deliberately carries no answer."""
+    position: int
+    section: str | None = None
+    question_id: str
+    question_type: str
+    question_text: str
+    options: list[dict[str, Any]] | None = None
+    difficulty: str | None = None
+
+
+class TestSession(BaseModel):
+    session_id: str
+    test_id: str
+    title: str
+    handoff_code: str | None = None
+    started_at: datetime
+    expires_at: datetime
+    submitted_at: datetime | None = None
+    duration_minutes: int | None = None
+    marks_correct: int = 4
+    marks_wrong: int = 1
+    marked_for_review: list[str] = []
+    # question_id -> the options chosen, so a resumed sitting restores its answers.
+    responses: dict[str, list[str]] = {}
+    paper: list[TestPaper] = []
+
+
+class TestSessionResult(BaseModel):
+    session_id: str
+    test_id: str
+    submitted_at: datetime | None = None
+    total_questions: int
+    correct_count: int
+    wrong_count: int
+    skipped_count: int
+    score: float
+    max_score: float
