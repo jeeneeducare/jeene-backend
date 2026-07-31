@@ -1,11 +1,12 @@
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from app.auth import current_tenant, require_user
+from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
 from app.schemas import (
     TestPaper,
@@ -15,6 +16,47 @@ from app.schemas import (
 )
 
 router = APIRouter()
+
+# Claim attempts per client, so guessing a code is visibly futile rather than merely
+# impractical. In-memory is enough: the window is a minute and a restart only forgives.
+_claim_attempts: dict[str, list[float]] = {}
+_CLAIM_LIMIT = 10
+_CLAIM_WINDOW_SECONDS = 60
+
+
+def _rate_limit_claim(client: str) -> None:
+    now = time.monotonic()
+    recent = [t for t in _claim_attempts.get(client, []) if now - t < _CLAIM_WINDOW_SECONDS]
+    if len(recent) >= _CLAIM_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many attempts. Wait a minute.")
+    recent.append(now)
+    _claim_attempts[client] = recent
+
+
+async def _authorized_session(
+    connection: asyncpg.Connection,
+    session_id: str,
+    user: dict | None,
+    web_token: str | None,
+):
+    """A sitting may be driven by the student's own token, or by the browser token
+    handed out when its code was claimed.
+
+    The browser is deliberately not asked to sign in: the code it was given was minted
+    by a signed-in student, so requiring identity again re-proves what the code already
+    proved, and does it while the clock runs. The token it gets back grants exactly this
+    sitting — no account, no other paper, no history.
+    """
+    session = await connection.fetchrow(
+        "SELECT * FROM test_sessions WHERE session_id = $1::uuid", session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if web_token and session["web_token"] and secrets.compare_digest(web_token, session["web_token"]):
+        return session
+    if user is not None and session["firebase_uid"] == user["uid"]:
+        return session
+    raise HTTPException(status_code=404, detail="Session not found")
 
 # Unambiguous when read aloud or typed: no O/0, I/1, S/5.
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRTUVWXYZ2346789"
@@ -147,12 +189,17 @@ async def start_session(
             session_id, test_id, user["uid"], tenant, code, expires,
         )
 
-    return await _session_payload(connection, session, test, tenant)
+    return await _session_payload(connection, session, test)
 
 
-async def _session_payload(connection, session, test, tenant) -> TestSession:
-    """A session plus everything a client needs to render or resume it."""
-    paper = await _paper_for(connection, session["test_id"], tenant)
+async def _session_payload(connection, session, test) -> TestSession:
+    """A session plus everything a client needs to render or resume it.
+
+    The tenant is read off the session row rather than the caller: a browser client
+    holding only a handoff token has no tenant of its own, and the sitting's own
+    tenant is the one that decides which paper it is.
+    """
+    paper = await _paper_for(connection, session["test_id"], session["tenant_id"])
 
     # The answer sheet, so a refresh or a move from phone to browser resumes rather
     # than starting over. Reading the sheet, not the attempt log: nothing is graded
@@ -198,59 +245,75 @@ async def _session_payload(connection, session, test, tenant) -> TestSession:
 @router.get("/tests/sessions/{session_id}", response_model=TestSession)
 async def resume_session(
     session_id: str,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
+    x_test_token: str | None = Header(default=None),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSession:
-    session = await connection.fetchrow(
-        "SELECT * FROM test_sessions WHERE session_id = $1::uuid AND firebase_uid = $2",
-        session_id,
-        user["uid"],
-    )
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await _authorized_session(connection, session_id, user, x_test_token)
     test = await connection.fetchrow(
         "SELECT test_id, title, duration_minutes, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
     )
-    return await _session_payload(connection, session, test, tenant)
+    return await _session_payload(connection, session, test)
 
 
 @router.post("/tests/handoff/{code}", response_model=TestSession)
 async def claim_handoff(
     code: str,
-    user: dict = Depends(require_user),
+    request: Request,
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSession:
-    """Exchange a handoff code for its session, so a paper started on the phone can be
+    """Exchange a handoff code for its sitting, so a paper started in the app can be
     sat in a browser.
 
-    The code is bound to the student who created it: signing in as someone else and
-    typing it does nothing. It is a credential for one sitting, not a paper selector.
+    Deliberately NOT signed in. The browser is only ever reachable with a code, and a
+    code is only minted by a signed-in student, so the code already carries the proof
+    of identity; asking again would re-prove it while the clock runs. What it grants is
+    exactly one sitting — no account, no other paper, no history.
+
+    Single use: the code dies on being claimed, so one glimpsed later is already spent.
+    The reply carries a separate `web_token`, which the browser sends thereafter.
     """
+    _rate_limit_claim(request.client.host if request.client else "unknown")
+
     session = await connection.fetchrow(
         "SELECT * FROM test_sessions WHERE handoff_code = $1",
         code.strip().upper(),
     )
     if session is None:
         raise HTTPException(status_code=404, detail="That code does not match a test")
-    if session["firebase_uid"] != user["uid"]:
-        raise HTTPException(status_code=403, detail="That code belongs to a different student")
     if session["submitted_at"] is not None:
         raise HTTPException(status_code=409, detail="That test has already been submitted")
+    if session["expires_at"] <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="That test's time is up")
+    if session["handoff_claimed_at"] is not None and session["web_token"]:
+        # Already open in a browser. Hand back the same sitting rather than refusing:
+        # a refresh must not lock a student out of their own paper mid-test.
+        pass
+    else:
+        session = await connection.fetchrow(
+            """
+            UPDATE test_sessions
+            SET handoff_claimed_at = now(), web_token = $2
+            WHERE session_id = $1 RETURNING *
+            """,
+            session["session_id"], secrets.token_urlsafe(32),
+        )
+
     test = await connection.fetchrow(
         "SELECT test_id, title, duration_minutes, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
     )
-    return await _session_payload(connection, session, test, tenant)
+    payload = await _session_payload(connection, session, test)
+    return payload.model_copy(update={"web_token": session["web_token"]})
 
 
 @router.post("/tests/sessions/{session_id}/submit", response_model=TestSessionResult)
 async def submit_session(
     session_id: str,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
+    x_test_token: str | None = Header(default=None),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSessionResult:
     """Finish a sitting: grade the answer sheet and score it.
@@ -263,12 +326,7 @@ async def submit_session(
     Idempotent. Submitting twice returns the same result rather than double-recording,
     since a flaky network on the last tap of a three-hour paper must not cost marks.
     """
-    session = await connection.fetchrow(
-        "SELECT * FROM test_sessions WHERE session_id = $1::uuid AND firebase_uid = $2",
-        session_id, user["uid"],
-    )
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await _authorized_session(connection, session_id, user, x_test_token)
 
     test = await connection.fetchrow(
         "SELECT test_id, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
@@ -304,7 +362,8 @@ async def submit_session(
                 VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, $8, $9, false)
                 ON CONFLICT (attempt_id) DO NOTHING
                 """,
-                attempt_id, user["uid"], tenant, r["question_id"], session_id,
+                attempt_id, session["firebase_uid"], session["tenant_id"],
+                r["question_id"], session_id,
                 list(r["selected_option_ids"] or []) or None, r["numeric_answer"],
                 is_correct, r["time_spent_ms"],
             )
@@ -363,8 +422,8 @@ async def save_response(
     payload: dict,
     session_id: str,
     question_id: str,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
+    x_test_token: str | None = Header(default=None),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> TestSession:
     """Write one answer onto the sheet. Nothing is graded here.
@@ -377,15 +436,7 @@ async def save_response(
 
     Sending `selected_option_ids: []` clears the answer, which is the CBT's Clear.
     """
-    session = await connection.fetchrow(
-        """
-        SELECT * FROM test_sessions
-        WHERE session_id = $1::uuid AND firebase_uid = $2
-        """,
-        session_id, user["uid"],
-    )
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+    session = await _authorized_session(connection, session_id, user, x_test_token)
     if session["submitted_at"] is not None:
         raise HTTPException(status_code=409, detail="That test has already been submitted")
     if session["expires_at"] <= datetime.now(timezone.utc):
@@ -425,4 +476,4 @@ async def save_response(
         "SELECT test_id, title, duration_minutes, marks_correct, marks_wrong FROM tests WHERE test_id = $1",
         session["test_id"],
     )
-    return await _session_payload(connection, session, test, tenant)
+    return await _session_payload(connection, session, test)
