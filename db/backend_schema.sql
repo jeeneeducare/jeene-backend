@@ -74,8 +74,14 @@ CREATE TABLE IF NOT EXISTS test_sessions (
   firebase_uid  TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
   tenant_id     TEXT NOT NULL REFERENCES tenants(tenant_id),
 
-  -- Short, human-typeable handle for moving this sitting to a browser.
+  -- Short, human-typeable handle for moving this sitting to a browser. Single use:
+  -- once claimed it stops working, so a code glimpsed later is already dead.
   handoff_code  TEXT UNIQUE,
+  handoff_claimed_at TIMESTAMPTZ,
+  -- Returned when the code is claimed, and the browser's credential thereafter.
+  -- Deliberately separate from session_id: an identifier that appears in URLs and
+  -- logs should not also be a key. Grants exactly this sitting and nothing else.
+  web_token     TEXT UNIQUE,
 
   started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- The clock is derived from started_at plus the paper's duration, never from

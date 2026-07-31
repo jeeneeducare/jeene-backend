@@ -189,6 +189,9 @@ class TestPaper(BaseModel):
 
 class TestSession(BaseModel):
     session_id: str
+    # Only ever populated when a handoff code is claimed: the browser's credential for
+    # this one sitting. Never returned to the app, which already holds a real token.
+    web_token: str | None = None
     test_id: str
     title: str
     handoff_code: str | None = None
