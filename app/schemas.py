@@ -259,6 +259,8 @@ class DayStudy(BaseModel):
     label: str
     minutes: int
     questions: int
+    correct: int = 0
+    accuracy: float = 0.0
 
 
 class HourAccuracy(BaseModel):
@@ -280,6 +282,20 @@ class SubjectSlice(BaseModel):
     attempted_questions: int
     solved_questions: int
     coverage: float
+
+
+class DifficultySlice(BaseModel):
+    """How the bank splits by difficulty, and how much of each the student has solved."""
+    difficulty: str
+    total: int
+    solved: int
+    attempted: int
+
+
+class TimeSplit(BaseModel):
+    """Where the time went. Only two things a student can do, so only two slices."""
+    practice_minutes: int
+    test_minutes: int
 
 
 class StreakInfo(BaseModel):
@@ -308,6 +324,8 @@ class ReportSummary(BaseModel):
     solved_questions: int
     coverage: float
     subjects: list[SubjectSlice] = []
+    difficulty: list[DifficultySlice] = []
+    time_split: TimeSplit
     by_day: list[DayStudy] = []
     by_hour: list[HourAccuracy] = []
     streak: StreakInfo

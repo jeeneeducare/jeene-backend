@@ -24,6 +24,8 @@ from app.auth import current_tenant, require_user
 from app.db import get_connection
 from app.schemas import (
     DayStudy,
+    DifficultySlice,
+    TimeSplit,
     HourAccuracy,
     ReportSummary,
     StreakInfo,
@@ -75,6 +77,11 @@ SELECT DISTINCT q.question_id, chapter.subject_id, q.question_type
   JOIN nodes chapter  ON chapter.node_id  = topic.parent_id
  WHERE q.tenant_id = $1 AND q.status = 'published' AND chapter.status = 'published'
 """
+
+
+_REACHABLE_WITH_DIFFICULTY = _REACHABLE.replace(
+    "q.question_type", "q.question_type, q.difficulty"
+)
 
 
 @router.get("/reports", response_model=ReportSummary)
@@ -181,6 +188,8 @@ async def get_reports(
         for r in subject_rows
     ]
 
+    difficulty = await _difficulty(connection, tenant, uid)
+    time_split = await _time_split(connection, uid, start)
     by_day = await _study_by_day(connection, uid, days=7)
     by_hour = await _accuracy_by_hour(connection, uid, start)
     streak = await _streak(connection, uid)
@@ -216,11 +225,71 @@ async def get_reports(
         solved_questions=available["solved"],
         coverage=_coverage(available["solved"], available["total"]),
         subjects=subjects,
+        difficulty=difficulty,
+        time_split=time_split,
         by_day=by_day,
         by_hour=by_hour,
         streak=streak,
         previous_attempted=previous_attempted,
         previous_minutes=previous_minutes,
+    )
+
+
+async def _difficulty(connection, tenant: str, uid: str) -> list[DifficultySlice]:
+    """The bank split by difficulty, with how far the student has got through each.
+
+    Always measured against the whole bank rather than the period, for the same reason
+    coverage is: it answers "how much of the hard material have I done", and that does
+    not reset. Questions with no difficulty recorded are left out rather than bundled
+    into a bucket they were never assigned to.
+    """
+    rows = await connection.fetch(
+        f"""
+        WITH reachable AS ({_REACHABLE_WITH_DIFFICULTY}),
+        mine AS (
+            SELECT question_id, BOOL_OR(is_correct) AS solved
+              FROM attempts WHERE firebase_uid = $2 GROUP BY question_id
+        )
+        SELECT r.difficulty,
+               COUNT(*) AS total,
+               COUNT(m.question_id) FILTER (WHERE m.solved) AS solved,
+               COUNT(m.question_id) AS attempted
+          FROM reachable r
+          LEFT JOIN mine m ON m.question_id = r.question_id
+         WHERE r.difficulty IS NOT NULL
+         GROUP BY r.difficulty
+        """,
+        tenant, uid,
+    )
+    order = {"easy": 0, "medium": 1, "hard": 2}
+    return sorted(
+        (
+            DifficultySlice(
+                difficulty=r["difficulty"],
+                total=r["total"],
+                solved=r["solved"],
+                attempted=r["attempted"],
+            )
+            for r in rows
+        ),
+        key=lambda d: order.get(d.difficulty, 9),
+    )
+
+
+async def _time_split(connection, uid: str, start) -> TimeSplit:
+    """Practice against papers. `session_id` is what tells the two apart."""
+    row = await connection.fetchrow(
+        """
+        SELECT COALESCE(SUM(time_spent_ms) FILTER (WHERE session_id IS NULL), 0) AS practice,
+               COALESCE(SUM(time_spent_ms) FILTER (WHERE session_id IS NOT NULL), 0) AS test
+          FROM attempts
+         WHERE firebase_uid = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)
+        """,
+        uid, start,
+    )
+    return TimeSplit(
+        practice_minutes=round(row["practice"] / 60000),
+        test_minutes=round(row["test"] / 60000),
     )
 
 
@@ -234,7 +303,8 @@ async def _study_by_day(connection, uid: str, days: int) -> list[DayStudy]:
         """
         SELECT (created_at AT TIME ZONE 'Asia/Kolkata')::date AS day,
                COALESCE(SUM(time_spent_ms), 0) AS ms,
-               COUNT(*) AS questions
+               COUNT(*) AS questions,
+               COUNT(*) FILTER (WHERE is_correct) AS correct
           FROM attempts
          WHERE firebase_uid = $1
            AND created_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date - ($2::int - 1)
@@ -255,6 +325,8 @@ async def _study_by_day(connection, uid: str, days: int) -> list[DayStudy]:
                 label=day.strftime("%a"),
                 minutes=round((row["ms"] if row else 0) / 60000),
                 questions=row["questions"] if row else 0,
+                correct=row["correct"] if row else 0,
+                accuracy=_accuracy(row["correct"], row["questions"]) if row else 0.0,
             )
         )
     return out
