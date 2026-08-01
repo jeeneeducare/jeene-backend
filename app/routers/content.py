@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.auth import current_tenant
 from app.db import get_connection
 from app.schemas import (
+    QuestionExplanation,
     Chapter,
     ConceptTag,
     PaginatedQuestions,
@@ -134,6 +135,43 @@ async def get_question(
         raise HTTPException(status_code=404, detail=f"Question '{question_id}' not found")
     figures = await _fetch_figures(connection, [question_id])
     return _row_to_question(row, figures)
+
+
+@router.get("/questions/{question_id}/explanation", response_model=QuestionExplanation)
+async def get_question_explanation(
+    question_id: str,
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> QuestionExplanation:
+    """A simpler retelling of the worked solution, for a student who is still stuck.
+
+    Served on exactly the same terms as the answer reveal, and gated by the same rule
+    for unreleased test papers: an explanation says what the answer is, so a second,
+    looser door to the same information would make the first one pointless.
+
+    A plain read. The explanation was written by the pipeline long before anyone asked
+    for it, so there is no model call on this path, nothing to rate limit, and nothing
+    to keep a student waiting. `draft` explanations are invisible here, exactly like
+    every other kind of content.
+    """
+    row = await connection.fetchrow(
+        """
+        SELECT e.question_id, e.text
+        FROM question_explanations e
+        JOIN questions q ON q.question_id = e.question_id
+        WHERE q.tenant_id = $1 AND q.question_id = $2
+          AND q.status = 'published' AND e.status = 'published'
+        """ + _NOT_UNRELEASED_TEST,
+        tenant,
+        question_id,
+    )
+    if row is None:
+        # Absent rather than empty: most questions will not have one for a while, and
+        # the app hides the button rather than offering something that is not there.
+        raise HTTPException(
+            status_code=404, detail=f"No explanation for '{question_id}' yet"
+        )
+    return QuestionExplanation(question_id=row["question_id"], text=row["text"])
 
 
 @router.get("/questions/{question_id}/answer", response_model=QuestionAnswer)

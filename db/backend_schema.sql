@@ -133,3 +133,35 @@ CREATE TABLE IF NOT EXISTS test_responses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_test_responses_session ON test_responses (session_id);
+
+-- One plain-language explanation per question, written by a model from the teacher's
+-- own worked solution and shown under "Understand with AI".
+--
+-- Keyed on the question, not the student: every student who asks about a question sees
+-- the same explanation, so the cost and the load are bounded by the size of the bank
+-- rather than by how many students there are. Nothing is generated while a student
+-- waits; these are written by the pipeline and read back as ordinary rows.
+CREATE TABLE IF NOT EXISTS question_explanations (
+    question_id     TEXT PRIMARY KEY REFERENCES questions(question_id) ON DELETE CASCADE,
+    tenant_id       TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    -- Which model and which prompt produced it. Improving the prompt is a deliberate
+    -- act: bump the version and regenerate, rather than leaving a bank half-written by
+    -- one prompt and half by another with no way to tell which is which.
+    model           TEXT NOT NULL,
+    prompt_version  INT  NOT NULL,
+    -- A hash of the question, its options and its worked solution. When a teacher
+    -- corrects a solution the hash moves, and the explanation derived from the old one
+    -- is stale — an explanation of a correction nobody made is worse than none.
+    source_hash     TEXT NOT NULL,
+    -- Follows the same draft-then-publish path as every other piece of content here.
+    status          TEXT NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft', 'published')),
+    tokens_in       INT,
+    tokens_out      INT,
+    generated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_question_explanations_status
+    ON question_explanations (status);

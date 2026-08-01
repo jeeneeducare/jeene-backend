@@ -333,3 +333,13 @@ class ReportSummary(BaseModel):
     # student has no history yet, and the screen shows no comparison at all.
     previous_attempted: int | None = None
     previous_minutes: int | None = None
+
+
+class QuestionExplanation(BaseModel):
+    """The plain-language explanation shown under "Understand with AI".
+
+    Written ahead of time by the pipeline from the teacher's own worked solution, and
+    read back here as an ordinary row. Nothing is generated while a student waits.
+    """
+    question_id: str
+    text: str

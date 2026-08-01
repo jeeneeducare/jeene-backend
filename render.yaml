@@ -19,5 +19,10 @@ services:
       # a wildcard: these endpoints accept a credential, and any site permitted here
       # could sit a paper on a student's behalf. Both Firebase Hosting domains for
       # the project are listed because either can serve the same deploy.
+      # DeepSeek key for writing question explanations. Set in the Render dashboard,
+      # never committed. Only the pipeline calls the model; the API never does, so this
+      # is here for the day generation moves onto a server rather than a laptop.
+      - key: DEEPSEEK_API_KEY
+        sync: false
       - key: JEENE_WEB_ORIGINS
         value: https://jeene-ff8e3.web.app,https://jeene-ff8e3.firebaseapp.com
