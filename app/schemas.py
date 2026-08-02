@@ -422,3 +422,16 @@ class ChapterNotes(BaseModel):
     pdf_url: str
     page_count: int
     size_bytes: int
+
+
+class ChapterVideo(BaseModel):
+    """One curated YouTube lecture for a chapter.
+
+    Ids are curated rather than searched for at runtime, so what a student sees is what
+    somebody chose. The title and channel come from YouTube itself at the time it was
+    added, so the tile reads the same as the video it opens.
+    """
+    youtube_id: str
+    title: str
+    channel: str = ""
+    thumbnail_url: str = ""

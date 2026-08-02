@@ -11,6 +11,7 @@ from app.schemas import (
     Question,
     QuestionAnswer,
     ChapterNotes,
+    ChapterVideo,
     QuestionFigure,
     QuestionHistory,
     TreeNode,
@@ -95,6 +96,33 @@ async def list_chapter_questions(
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
     return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
+
+
+@router.get("/chapters/{chapter_id}/videos", response_model=list[ChapterVideo])
+async def chapter_videos(
+    chapter_id: str,
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[ChapterVideo]:
+    """The chapter's curated lectures, in the order somebody put them in.
+
+    An empty list rather than a 404, because "this chapter has no videos yet" is an
+    ordinary answer here and not a missing resource. The app asks as a chapter opens so
+    the Video Lectures tile can show a count, or say there are none, before a student
+    taps it.
+    """
+    rows = await connection.fetch(
+        """
+        SELECT v.youtube_id, v.title, v.channel, v.thumbnail_url
+          FROM chapter_videos v
+          JOIN nodes c ON c.node_id = v.chapter_id
+         WHERE v.chapter_id = $1 AND v.tenant_id = $2 AND v.status = 'published'
+           AND c.status = 'published'
+         ORDER BY v.position, v.added_at
+        """,
+        chapter_id, tenant,
+    )
+    return [ChapterVideo(**dict(r)) for r in rows]
 
 
 @router.get("/chapters/{chapter_id}/notes", response_model=ChapterNotes)
