@@ -1,5 +1,8 @@
+import re
+
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 
 from app.auth import current_tenant, require_user
 from app.db import get_connection
@@ -96,6 +99,72 @@ async def list_chapter_questions(
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
     return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
+
+
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+# The player page, served from our own domain so it has a real origin and sends a real
+# referrer. Both are what YouTube's embed checks before it will configure itself, and
+# neither can be faked from inside an app: a web view handed HTML with a base URL only
+# resolves relative links against it, it does not take on that origin, and a web view
+# navigating straight to the embed URL sends no referrer at all. Those two facts cost
+# three attempts to learn.
+#
+# Serving it here rather than bundling it in the apps also means the player can be fixed
+# without a release, which after those three attempts is worth something on its own.
+_PLAYER_PAGE = """<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1,
+          user-scalable=no">
+    <style>
+      html, body {{ margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }}
+      #player {{ width: 100%; height: 100%; }}
+    </style>
+  </head>
+  <body>
+    <div id="player"></div>
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script>
+      function say(what) {{
+        // iOS listens on a message handler, Android reads the console. Both are one way.
+        if (window.webkit && window.webkit.messageHandlers
+            && window.webkit.messageHandlers.player) {{
+          window.webkit.messageHandlers.player.postMessage(what);
+        }}
+        console.log("jeene-player " + what);
+      }}
+      function onYouTubeIframeAPIReady() {{
+        new YT.Player("player", {{
+          videoId: "{video_id}",
+          playerVars: {{ playsinline: 1, rel: 0, modestbranding: 1, origin: "{origin}" }},
+          events: {{
+            onReady: function () {{ say("ready"); }},
+            onError: function (e) {{ say("error " + e.data); }}
+          }}
+        }});
+      }}
+      setTimeout(function () {{
+        if (typeof YT === "undefined") say("error -1");
+      }}, 8000);
+    </script>
+  </body>
+</html>
+"""
+
+
+@router.get("/player", response_class=HTMLResponse)
+async def player(request: Request, v: str) -> HTMLResponse:
+    """A page holding one YouTube player, for the apps to load in a web view.
+
+    The video id is checked against the id alphabet before it is put into the page. It
+    arrives in a query string, which is to say from anywhere, and it is written into a
+    script; without this that is an injection.
+    """
+    if not _VIDEO_ID.match(v):
+        raise HTTPException(status_code=400, detail="Not a YouTube video id")
+    origin = str(request.base_url).rstrip("/")
+    return HTMLResponse(_PLAYER_PAGE.format(video_id=v, origin=origin))
 
 
 @router.get("/chapters/{chapter_id}/videos", response_model=list[ChapterVideo])

@@ -179,3 +179,33 @@ def test_single_question_hides_answer_but_reveal_exposes_it(client):
 )
 def test_unknown_ids_return_404(client, path):
     assert client.get(path).status_code == 404
+
+
+# --- the player page ------------------------------------------------------------
+
+def test_the_player_page_refuses_anything_that_is_not_a_video_id():
+    """The id arrives in a query string and is written into a script tag.
+
+    Without this check that is an injection: anyone can hand the app a URL and have
+    their own JavaScript served from our origin.
+    """
+    from app.routers.content import _VIDEO_ID
+
+    assert _VIDEO_ID.match("a2T84FeLIdY")
+    assert _VIDEO_ID.match("BX6mVAJQbnE")
+    assert not _VIDEO_ID.match('"></script><script>alert(1)</script>')
+    assert not _VIDEO_ID.match("short")
+    assert not _VIDEO_ID.match("way_too_long_for_an_id")
+    assert not _VIDEO_ID.match("has spaces")
+    assert not _VIDEO_ID.match("")
+
+
+def test_the_player_page_carries_the_id_and_a_real_origin():
+    from app.routers.content import _PLAYER_PAGE
+
+    page = _PLAYER_PAGE.format(video_id="a2T84FeLIdY", origin="https://example.test")
+    assert '"a2T84FeLIdY"' in page
+    assert 'origin: "https://example.test"' in page
+    # The whole reason this page exists rather than a hand-written iframe.
+    assert "https://www.youtube.com/iframe_api" in page
+    assert "onError" in page
