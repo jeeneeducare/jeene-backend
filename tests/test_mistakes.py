@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.routers.mistakes import _assemble, _wilson_lower_bound
+from app.routers.mistakes import _assemble, _wilson_lower_bound, _worth_doing
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -50,6 +50,26 @@ def test_more_evidence_of_the_same_rate_ranks_higher():
 
 def test_no_attempts_scores_zero():
     assert _wilson_lower_bound(0, 0) == 0.0
+
+
+def test_a_bigger_gap_outranks_a_more_certain_but_tiny_one():
+    """Confidence alone is not the question.
+
+    Two wrong out of two is more certain than ten out of fifteen, and less worth doing.
+    A "start here" list that opens with a topic holding two questions, above one holding
+    ten, is answering the wrong question.
+    """
+    assert _wilson_lower_bound(2, 2) > _wilson_lower_bound(10, 15)   # more certain
+    assert _worth_doing(2, 2) < _worth_doing(10, 15)                 # less worth doing
+
+
+def test_size_cannot_take_over_the_ranking_completely():
+    """The square root is what stops one huge topic burying a flat failure.
+
+    Sixteen outstanding at half-right must not outrank three out of three wrong by so
+    much that the second never appears.
+    """
+    assert _worth_doing(3, 3) > _worth_doing(2, 4)
 
 
 def test_ranking_puts_the_better_evidenced_weakness_first():

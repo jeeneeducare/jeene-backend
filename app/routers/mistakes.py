@@ -15,12 +15,21 @@ every count that drives the screen is taken from the most recent attempt per que
 and the difference between "ever wrong" and "still wrong" becomes the progress the
 student is actually making.
 
-**Small samples do not get to be alarming.** Ranked purely by accuracy, one careless slip
-on the only question you have tried in a topic makes it your weakest subject in the
-world. The ranking therefore uses the lower bound of a Wilson interval on the error rate,
-which is the standard way of saying: how badly wrong would this have to be for the
-evidence to support it. One miss out of one scores below eight out of ten, and the order
-settles as more questions are answered rather than lurching about.
+**The order answers "where should I spend the next hour".** That is two questions, not
+one, and ranking on either alone gets it wrong.
+
+Ranked purely by accuracy, one careless slip on the only question you ever tried in a
+topic makes it your weakest subject in the world. So confidence comes from the lower
+bound of a Wilson interval on the error rate, which is the standard way of asking how
+badly wrong this would have to be for the evidence to support it. One miss out of one
+scores well below eight out of ten, and the order settles as more questions are answered
+rather than lurching about.
+
+But confidence alone puts a topic with two questions outstanding above one with ten,
+because two out of two is more certain than ten out of fifteen. Certain is not the same
+as worth doing. The score is therefore the confidence weighted by how much is actually
+left, square-rooted so that one enormous topic cannot bury everything else and a small
+but flatly-failed one still surfaces.
 """
 
 from __future__ import annotations
@@ -155,8 +164,8 @@ def _wilson_lower_bound(wrong: int, attempted: int) -> float:
     """How high the error rate can be said to be, conservatively.
 
     A topic with one miss out of one has an observed error rate of 1.0 and almost no
-    evidence behind it; this returns about 0.2 for that and about 0.5 for eight misses
-    out of ten, which is the ordering the screen wants.
+    evidence behind it; this returns about 0.38 for that against about 0.60 for eight
+    misses out of ten, which is the ordering the screen wants.
     """
     if attempted <= 0:
         return 0.0
@@ -165,6 +174,17 @@ def _wilson_lower_bound(wrong: int, attempted: int) -> float:
     centre = p + z2 / (2 * attempted)
     spread = WILSON_Z * ((p * (1 - p) + z2 / (4 * attempted)) / attempted) ** 0.5
     return max(0.0, (centre - spread) / (1 + z2 / attempted))
+
+
+def _worth_doing(wrong: int, attempted: int) -> float:
+    """How much a topic deserves to be at the top of the list.
+
+    Confidence that the gap is real, multiplied by how much of it is left. The square
+    root keeps the second factor from taking over: a topic with sixteen outstanding is
+    weighted four times one with a single question, not sixteen times, so a small topic
+    the student is failing outright still gets seen.
+    """
+    return _wilson_lower_bound(wrong, attempted) * (wrong ** 0.5)
 
 
 def _assemble(rows, ever_wrong_ids, concepts, subject_titles) -> MistakeBook:
@@ -212,7 +232,7 @@ def _assemble(rows, ever_wrong_ids, concepts, subject_titles) -> MistakeBook:
     ranked = sorted(
         (t for t in topics.values() if t["unfixed"] > 0),
         key=lambda t: (
-            -_wilson_lower_bound(t["unfixed"], t["attempted"]),
+            -_worth_doing(t["unfixed"], t["attempted"]),
             -t["unfixed"],
             t["title"],
         ),
