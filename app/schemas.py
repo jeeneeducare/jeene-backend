@@ -409,3 +409,16 @@ class QuestionHistory(BaseModel):
     # True when the attempt came from a mock paper rather than from practice. The
     # navigator does not distinguish them, but the deck can say where a mark came from.
     in_a_test: bool = False
+
+
+class ChapterNotes(BaseModel):
+    """The teacher's written notes for a chapter, as a hosted PDF.
+
+    One document per chapter rather than per topic. Topic notes do not exist yet, and a
+    student opening Notes from a topic is better served the chapter's than nothing.
+    """
+    chapter_id: str
+    title: str
+    pdf_url: str
+    page_count: int
+    size_bytes: int

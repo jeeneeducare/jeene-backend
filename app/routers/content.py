@@ -10,6 +10,7 @@ from app.schemas import (
     PaginatedQuestions,
     Question,
     QuestionAnswer,
+    ChapterNotes,
     QuestionFigure,
     QuestionHistory,
     TreeNode,
@@ -94,6 +95,34 @@ async def list_chapter_questions(
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
     return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
+
+
+@router.get("/chapters/{chapter_id}/notes", response_model=ChapterNotes)
+async def chapter_notes(
+    chapter_id: str,
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> ChapterNotes:
+    """The written notes for a chapter, if there are any published.
+
+    404 when a chapter has none, which is most of them today: notes exist for eight
+    physics chapters and nowhere else yet. The app asks when a chapter opens so the Notes
+    tile can say whether there is anything behind it, rather than letting a student tap
+    and find out.
+    """
+    row = await connection.fetchrow(
+        """
+        SELECT n.chapter_id, n.title, n.pdf_url, n.page_count, n.size_bytes
+          FROM chapter_notes n
+          JOIN nodes c ON c.node_id = n.chapter_id
+         WHERE n.chapter_id = $1 AND n.tenant_id = $2 AND n.status = 'published'
+           AND c.status = 'published'
+        """,
+        chapter_id, tenant,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="No notes for this chapter yet")
+    return ChapterNotes(**dict(row))
 
 
 @router.get("/chapters/{chapter_id}/history", response_model=list[QuestionHistory])
