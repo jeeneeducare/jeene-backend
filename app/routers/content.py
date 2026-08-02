@@ -1,7 +1,7 @@
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.auth import current_tenant
+from app.auth import current_tenant, require_user
 from app.db import get_connection
 from app.schemas import (
     QuestionExplanation,
@@ -11,6 +11,7 @@ from app.schemas import (
     Question,
     QuestionAnswer,
     QuestionFigure,
+    QuestionHistory,
     TreeNode,
 )
 
@@ -93,6 +94,66 @@ async def list_chapter_questions(
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
     return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
+
+
+@router.get("/chapters/{chapter_id}/history", response_model=list[QuestionHistory])
+async def chapter_history(
+    chapter_id: str,
+    user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[QuestionHistory]:
+    """What this student has already done with the questions in this chapter.
+
+    The practice deck uses it twice over. Opened normally it redraws each answered
+    question exactly as the student left it, right or wrong, rather than presenting work
+    they have already done as though it were new. Opened from the Mistake Book it is the
+    other way round: the wrong ones are the only ones shown, and they are shown blank.
+
+    Only the most recent attempt per question, because that is the one that describes
+    where the student stands. Answering something correctly should replace the record of
+    getting it wrong, not sit underneath it.
+
+    Returning the key and the solution here is deliberate and is safe for one specific
+    reason: an attempt row only exists once a question has been graded and its answer
+    shown. Practice grades on the spot, and a paper writes its attempts at submission,
+    never during the sitting. So every question this can speak about is one the student
+    has already seen the answer to.
+    """
+    rows = await _fetch_chapter_subtree(connection, chapter_id, tenant)
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
+
+    history = await connection.fetch(
+        """
+        SELECT DISTINCT ON (a.question_id)
+               a.question_id, a.selected_option_ids, a.is_correct, a.created_at,
+               a.session_id IS NOT NULL AS in_a_test,
+               q.correct_option_ids, q.explanation_json
+          FROM attempts a
+          JOIN questions q ON q.question_id = a.question_id
+          JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
+         WHERE a.firebase_uid = $1 AND a.tenant_id = $2
+           AND qcm.concept_node_id = ANY($3::text[])
+           AND q.status = 'published'
+        """ + _NOT_UNRELEASED_TEST + """
+         ORDER BY a.question_id, a.created_at DESC
+        """,
+        user["uid"], tenant, [r["node_id"] for r in rows],
+    )
+
+    return [
+        QuestionHistory(
+            question_id=r["question_id"],
+            selected_option_ids=list(r["selected_option_ids"] or []),
+            is_correct=r["is_correct"],
+            correct_option_ids=list(r["correct_option_ids"] or []),
+            explanation=(r["explanation_json"] or {}).get("text", ""),
+            attempted_at=r["created_at"],
+            in_a_test=r["in_a_test"],
+        )
+        for r in history
+    ]
 
 
 @router.get("/concepts/{concept_id}/questions", response_model=PaginatedQuestions)

@@ -390,3 +390,22 @@ class MistakeBook(BaseModel):
     topics_affected: int
     subjects: list[SubjectWeakness] = []
     topics: list[WeakTopic] = []
+
+
+class QuestionHistory(BaseModel):
+    """How a student left one question the last time they met it.
+
+    Carries the key and the worked solution, which is only safe because a row exists
+    here at all: an attempt is recorded when a question is graded, so by the time this
+    can be returned the student has already been shown the answer. Nothing is revealed
+    that they have not already earned.
+    """
+    question_id: str
+    selected_option_ids: list[str] = []
+    is_correct: bool
+    correct_option_ids: list[str] = []
+    explanation: str = ""
+    attempted_at: datetime
+    # True when the attempt came from a mock paper rather than from practice. The
+    # navigator does not distinguish them, but the deck can say where a mark came from.
+    in_a_test: bool = False
