@@ -170,6 +170,7 @@ async def player(request: Request, v: str) -> HTMLResponse:
 @router.get("/chapters/{chapter_id}/videos", response_model=list[ChapterVideo])
 async def chapter_videos(
     chapter_id: str,
+    request: Request,
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[ChapterVideo]:
@@ -191,7 +192,11 @@ async def chapter_videos(
         """,
         chapter_id, tenant,
     )
-    return [ChapterVideo(**dict(r)) for r in rows]
+    origin = str(request.base_url).rstrip("/")
+    return [
+        ChapterVideo(**dict(r), player_url=f"{origin}/player?v={r['youtube_id']}")
+        for r in rows
+    ]
 
 
 @router.get("/chapters/{chapter_id}/notes", response_model=ChapterNotes)

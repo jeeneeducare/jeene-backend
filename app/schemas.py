@@ -435,3 +435,7 @@ class ChapterVideo(BaseModel):
     title: str
     channel: str = ""
     thumbnail_url: str = ""
+    # The page the apps load to play this. Built by the server rather than the app so the
+    # player can be fixed or moved without an app release, which the three attempts it
+    # took to get playback working made a very concrete argument for.
+    player_url: str = ""
