@@ -343,3 +343,50 @@ class QuestionExplanation(BaseModel):
     """
     question_id: str
     text: str
+
+
+class WeakTopic(BaseModel):
+    """One topic a student keeps getting wrong, and where to go and fix it.
+
+    Carries `chapter_id` and `concept_ids` because the point of the screen is the jump:
+    tapping a row has to open the practice deck already narrowed to this topic, and the
+    app filters a chapter's questions by concept locally rather than asking again.
+    """
+    topic_id: str
+    title: str
+    chapter_id: str
+    chapter_title: str
+    subject_id: str
+    subject_title: str
+    concept_ids: list[str] = []
+    attempted: int
+    wrong: int
+    accuracy: float
+    # Of the questions ever answered wrong here, how many are still wrong on the most
+    # recent try. This is the number the screen leads with: it is the work remaining.
+    unfixed: int
+    practice_wrong: int
+    test_wrong: int
+    last_wrong_at: datetime | None = None
+
+
+class SubjectWeakness(BaseModel):
+    subject_id: str
+    title: str
+    attempted: int
+    wrong: int
+    accuracy: float
+
+
+class MistakeBook(BaseModel):
+    """Everything the Mistake Book screen shows, from one read of the attempt log."""
+    attempted: int
+    ever_wrong: int
+    unfixed: int
+    fixed: int
+    accuracy: float
+    practice_wrong: int
+    test_wrong: int
+    topics_affected: int
+    subjects: list[SubjectWeakness] = []
+    topics: list[WeakTopic] = []
