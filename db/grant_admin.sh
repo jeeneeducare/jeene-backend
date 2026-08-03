@@ -7,10 +7,11 @@
 # email can be changed on a Google account and a uid cannot, so the uid is the identity
 # and the email is a label.
 #
-# The uid only exists once that person has signed in to something Firebase at least once,
-# which for the admin panel means opening it and being told they are not an administrator.
-# That refusal is the step that creates them. So the order is: they sign in, get refused,
-# you run this, they reload.
+# The uid only exists once that person has signed in at least once, so for somebody new
+# there is nothing to key a grant to yet. In that case this leaves an invite against their
+# email instead, and the first request carrying a verified token for that address turns it
+# into a real grant and uses the invite up. Either way you run this once and they sign in
+# once, in whichever order suits.
 #
 # Usage:
 #   ./grant_admin.sh someone@gmail.com                 # grant
@@ -32,7 +33,10 @@ fi
 
 if [[ "${1:-}" == "--list" ]]; then
   psql "$JEENE_POSTGRES_URL" -c \
-    "SELECT email, tenant_id, note, added_at FROM admins ORDER BY added_at;"
+    "SELECT email, tenant_id, note, added_at, 'active' AS state FROM admins
+     UNION ALL
+     SELECT email, tenant_id, note, invited_at, 'invited' FROM admin_invites
+     ORDER BY added_at;"
   exit 0
 fi
 
@@ -53,8 +57,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $REVOKE; then
+  # Both, since a grant may still be an unclaimed invite.
   psql "$JEENE_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
-    "DELETE FROM admins WHERE lower(email) = lower('${EMAIL//\'/\'\'}');"
+    "DELETE FROM admins WHERE lower(email) = lower('${EMAIL//\'/\'\'}');
+     DELETE FROM admin_invites WHERE email = lower('${EMAIL//\'/\'\'}');"
   echo "Revoked $EMAIL. It takes effect on their next request; a page already open keeps"
   echo "working until it asks the server for something, which is within a click or two."
   exit 0
@@ -76,14 +82,23 @@ UID_FOUND="$(curl -fsS -X POST \
   | python3 -c 'import json,sys; u=json.load(sys.stdin).get("users",[]); print(u[0]["localId"] if u else "")')"
 
 if [[ -z "$UID_FOUND" ]]; then
-  cat >&2 <<MSG
-No Firebase account for ${EMAIL} yet.
+  # No account yet, which is the ordinary case for somebody new. Leave the grant waiting
+  # for them by email; the first request carrying a verified token for that address turns
+  # it into a real one. Nobody has to sign in, be refused, and come back.
+  psql "$JEENE_POSTGRES_URL" -v ON_ERROR_STOP=1 <<SQL
+INSERT INTO admin_invites (email, tenant_id, note, invited_by)
+VALUES (lower('${EMAIL//\'/\'\'}'), '${TENANT}', '${NOTE//\'/\'\'}', '$(whoami)')
+ON CONFLICT (email) DO UPDATE
+  SET tenant_id = EXCLUDED.tenant_id, note = EXCLUDED.note, invited_at = now();
+SQL
+  cat <<MSG
 
-They need to open https://jeene-admin.web.app and sign in with Google once. They will be
-told they are not an administrator, which is correct and is the step that creates the
-account. Run this again afterwards.
+${EMAIL} has no Firebase account yet, so the access is waiting for them instead.
+
+Send them https://jeene-admin.web.app. They sign in with Google and they are straight in;
+the invite becomes a real grant on their first request and is used up doing it.
 MSG
-  exit 1
+  exit 0
 fi
 
 psql "$JEENE_POSTGRES_URL" -v ON_ERROR_STOP=1 <<SQL

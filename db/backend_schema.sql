@@ -203,3 +203,21 @@ CREATE TABLE IF NOT EXISTS admins (
     note         text NOT NULL DEFAULT '',
     added_at     timestamptz NOT NULL DEFAULT now()
 );
+
+-- Admin invites: access granted to an email before that person has an account.
+--
+-- `admins` is keyed by Firebase uid, which is the right identity to check against: an
+-- email can be reassigned on a Google Workspace account and a uid cannot. But a uid does
+-- not exist until somebody has signed in, so granting access to a new colleague meant
+-- asking them to sign in, be refused, and wait for a second step.
+--
+-- An invite is that grant, held by email until there is a uid to attach it to. It is
+-- claimed on the first request that arrives with a verified token for that address, and
+-- deleted in the same transaction, so it is a one-time key rather than a standing rule.
+CREATE TABLE IF NOT EXISTS admin_invites (
+    email      text PRIMARY KEY,
+    tenant_id  text NOT NULL,
+    note       text NOT NULL DEFAULT '',
+    invited_by text NOT NULL DEFAULT '',
+    invited_at timestamptz NOT NULL DEFAULT now()
+);

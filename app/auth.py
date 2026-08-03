@@ -73,6 +73,50 @@ async def require_user(authorization: Optional[str] = Header(default=None)) -> d
     return decoded
 
 
+async def _claim_invite(user: dict, connection: asyncpg.Connection):
+    """Turn an invite for this person's email into a real admin row, once.
+
+    A uid only exists after somebody signs in, so access could not be granted ahead of
+    time and every new colleague had to sign in, be refused, and wait for a second step.
+    An invite is the grant held by email until there is a uid to attach it to.
+
+    The email is taken from the verified token and nowhere else, and only when Firebase
+    says it is verified. An unverified address proves nothing: anyone can put any email on
+    an account, and honouring one would turn this table into a list of addresses worth
+    claiming rather than a list of people who have been given access.
+
+    Claiming deletes the invite in the same transaction, so it is a one-time key. If two
+    requests arrive together, one inserts and the other finds the row already there.
+    """
+    email = (user.get("email") or "").strip().lower()
+    if not email or not user.get("email_verified"):
+        return None
+
+    async with connection.transaction():
+        invite = await connection.fetchrow(
+            "SELECT email, tenant_id, note FROM admin_invites WHERE email = $1 FOR UPDATE",
+            email,
+        )
+        if invite is None:
+            return None
+        await connection.execute(
+            """
+            INSERT INTO admins (firebase_uid, tenant_id, email, note)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (firebase_uid) DO UPDATE
+              SET email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id
+            """,
+            user["uid"], invite["tenant_id"], email, invite["note"],
+        )
+        await connection.execute("DELETE FROM admin_invites WHERE email = $1", email)
+        logger.info("Claimed an admin invite for %s", email)
+
+    return await connection.fetchrow(
+        "SELECT firebase_uid, tenant_id, email FROM admins WHERE firebase_uid = $1",
+        user["uid"],
+    )
+
+
 async def require_admin(
     user: dict = Depends(require_user),
     connection: asyncpg.Connection = Depends(get_connection),
@@ -91,6 +135,8 @@ async def require_admin(
         "SELECT firebase_uid, tenant_id, email FROM admins WHERE firebase_uid = $1",
         user["uid"],
     )
+    if row is None:
+        row = await _claim_invite(user, connection)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
