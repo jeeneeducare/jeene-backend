@@ -15,6 +15,7 @@ from app.schemas import (
     QuestionAnswer,
     ChapterNotes,
     ChapterVideo,
+    VideoGroup,
     QuestionFigure,
     QuestionHistory,
     TreeNode,
@@ -213,6 +214,94 @@ async def node_videos(
         ChapterVideo(**dict(r), player_url=f"{origin}/player?v={r['youtube_id']}")
         for r in rows
     ]
+
+
+@router.get("/nodes/{node_id}/video-groups", response_model=list[VideoGroup])
+async def node_video_groups(
+    node_id: str,
+    request: Request,
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[VideoGroup]:
+    """Everything a student standing on this node should be offered, grouped by where it hangs.
+
+    `/nodes/{id}/videos` walks *up* and stops at the first level with anything, which is
+    right when the question is "what plays here". It is wrong for a screen, because a
+    subtopic with one lecture on each of its concepts looks empty: the walk never looks
+    down.
+
+    So this looks down first. The node's own videos, then each descendant that has any, in
+    tree order, each labelled with the node it belongs to. Only if there is nothing at or
+    below does it fall back to walking up, so a chapter-wide lecture still reaches a
+    concept that has none of its own; that group comes back marked inherited so the screen
+    can say where it came from rather than implying it lives here.
+    """
+    below = await connection.fetch(
+        """
+        WITH RECURSIVE subtree AS (
+            SELECT node_id, parent_id, title, type, display_order,
+                   ARRAY[coalesce(display_order, 0)] AS ordering, 0 AS depth
+              FROM nodes WHERE node_id = $1 AND tenant_id = $2 AND status = 'published'
+            UNION ALL
+            SELECT n.node_id, n.parent_id, n.title, n.type, n.display_order,
+                   s.ordering || coalesce(n.display_order, 0), s.depth + 1
+              FROM nodes n JOIN subtree s ON n.parent_id = s.node_id
+             WHERE n.tenant_id = $2 AND n.status = 'published'
+        )
+        SELECT s.node_id, s.title, s.type, s.ordering, s.depth,
+               v.youtube_id, v.title AS video_title, v.channel, v.thumbnail_url, v.position
+          FROM subtree s
+          JOIN node_videos v ON v.node_id = s.node_id
+         WHERE v.tenant_id = $2 AND v.status = 'published'
+         ORDER BY s.depth, s.ordering, v.position, v.added_at
+        """,
+        node_id, tenant,
+    )
+
+    origin = str(request.base_url).rstrip("/")
+
+    def as_video(row) -> ChapterVideo:
+        return ChapterVideo(
+            youtube_id=row["youtube_id"], title=row["video_title"],
+            channel=row["channel"], thumbnail_url=row["thumbnail_url"],
+            player_url=f"{origin}/player?v={row['youtube_id']}",
+        )
+
+    if below:
+        groups: list[VideoGroup] = []
+        for row in below:
+            if not groups or groups[-1].node_id != row["node_id"]:
+                groups.append(VideoGroup(
+                    node_id=row["node_id"], title=row["title"], type=row["type"]))
+            groups[-1].videos.append(as_video(row))
+        return groups
+
+    # Nothing here or under it. Fall back to whatever a student would inherit.
+    above = await node_videos(node_id, request, tenant, connection)
+    if not above:
+        return []
+    owner = await connection.fetchrow(
+        """
+        WITH RECURSIVE lineage AS (
+            SELECT node_id, parent_id, 0 AS distance FROM nodes
+             WHERE node_id = $1 AND tenant_id = $2
+            UNION ALL
+            SELECT n.node_id, n.parent_id, l.distance + 1
+              FROM nodes n JOIN lineage l ON n.node_id = l.parent_id WHERE n.tenant_id = $2
+        )
+        SELECT n.node_id, n.title, n.type FROM lineage l
+          JOIN nodes n ON n.node_id = l.node_id
+         WHERE EXISTS (SELECT 1 FROM node_videos v
+                        WHERE v.node_id = l.node_id AND v.tenant_id = $2
+                          AND v.status = 'published')
+         ORDER BY l.distance LIMIT 1
+        """,
+        node_id, tenant,
+    )
+    if owner is None:
+        return []
+    return [VideoGroup(node_id=owner["node_id"], title=owner["title"],
+                       type=owner["type"], inherited=True, videos=above)]
 
 
 @router.get("/chapters/{chapter_id}/videos", response_model=list[ChapterVideo])

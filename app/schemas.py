@@ -471,3 +471,19 @@ class ChapterSummary(BaseModel):
     class_level: int | None = None
     status: str = "draft"
     video_count: int = 0
+
+
+class VideoGroup(BaseModel):
+    """The lectures hanging on one node, labelled with the node they belong to.
+
+    A subtopic's screen shows its own videos and its concepts' videos together, so the
+    student can see there is a general one and three specific ones rather than only
+    whichever level happened to be asked about. The grouping is what keeps that readable.
+    """
+    node_id: str
+    title: str
+    type: str
+    # True when this group is not the node asked about but an ancestor it inherits from,
+    # so the screen can say where the videos came from instead of implying they are here.
+    inherited: bool = False
+    videos: list[ChapterVideo] = []
