@@ -167,6 +167,54 @@ async def player(request: Request, v: str) -> HTMLResponse:
     return HTMLResponse(_PLAYER_PAGE.format(video_id=v, origin=origin))
 
 
+@router.get("/nodes/{node_id}/videos", response_model=list[ChapterVideo])
+async def node_videos(
+    node_id: str,
+    request: Request,
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[ChapterVideo]:
+    """The lectures for one place in the tree, or the nearest thing above it.
+
+    A video can be attached to a chapter, a topic, a subtopic or a concept. A student
+    opening Video Lectures from a topic should see that topic's videos if there are any,
+    and the chapter's if there are not, rather than nothing: a general lecture is still
+    better than an empty screen, and the person attaching a chapter-wide video should not
+    have to repeat it on every topic underneath.
+
+    So this walks up from the node and returns the first level that has anything. Only
+    the first: mixing a topic's own videos with the chapter's would bury the specific one
+    under the general.
+    """
+    rows = await connection.fetch(
+        """
+        WITH RECURSIVE lineage AS (
+            SELECT node_id, parent_id, 0 AS distance
+              FROM nodes WHERE node_id = $1 AND tenant_id = $2 AND status = 'published'
+            UNION ALL
+            SELECT n.node_id, n.parent_id, l.distance + 1
+              FROM nodes n JOIN lineage l ON n.node_id = l.parent_id
+             WHERE n.tenant_id = $2 AND n.status = 'published'
+        ),
+        found AS (
+            SELECT v.*, l.distance
+              FROM node_videos v JOIN lineage l ON l.node_id = v.node_id
+             WHERE v.tenant_id = $2 AND v.status = 'published'
+        )
+        SELECT youtube_id, title, channel, thumbnail_url
+          FROM found
+         WHERE distance = (SELECT min(distance) FROM found)
+         ORDER BY position, added_at
+        """,
+        node_id, tenant,
+    )
+    origin = str(request.base_url).rstrip("/")
+    return [
+        ChapterVideo(**dict(r), player_url=f"{origin}/player?v={r['youtube_id']}")
+        for r in rows
+    ]
+
+
 @router.get("/chapters/{chapter_id}/videos", response_model=list[ChapterVideo])
 async def chapter_videos(
     chapter_id: str,
@@ -174,29 +222,8 @@ async def chapter_videos(
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[ChapterVideo]:
-    """The chapter's curated lectures, in the order somebody put them in.
-
-    An empty list rather than a 404, because "this chapter has no videos yet" is an
-    ordinary answer here and not a missing resource. The app asks as a chapter opens so
-    the Video Lectures tile can show a count, or say there are none, before a student
-    taps it.
-    """
-    rows = await connection.fetch(
-        """
-        SELECT v.youtube_id, v.title, v.channel, v.thumbnail_url
-          FROM chapter_videos v
-          JOIN nodes c ON c.node_id = v.chapter_id
-         WHERE v.chapter_id = $1 AND v.tenant_id = $2 AND v.status = 'published'
-           AND c.status = 'published'
-         ORDER BY v.position, v.added_at
-        """,
-        chapter_id, tenant,
-    )
-    origin = str(request.base_url).rstrip("/")
-    return [
-        ChapterVideo(**dict(r), player_url=f"{origin}/player?v={r['youtube_id']}")
-        for r in rows
-    ]
+    """The chapter's own lectures. Kept for the app's chapter-level tile."""
+    return await node_videos(chapter_id, request, tenant, connection)
 
 
 @router.get("/chapters/{chapter_id}/notes", response_model=ChapterNotes)

@@ -73,6 +73,32 @@ async def require_user(authorization: Optional[str] = Header(default=None)) -> d
     return decoded
 
 
+async def require_admin(
+    user: dict = Depends(require_user),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> dict:
+    """Dependency for anything that writes content. 403 unless the caller is listed.
+
+    A valid token is not the check and can never be: every student who has ever opened
+    the app holds one. Membership is a row in `admins`, so access is granted and revoked
+    with a single statement and is visible to anyone who looks, rather than living in a
+    custom claim that nobody can enumerate and that needs the Admin SDK to change.
+
+    The tenant comes from the row rather than from the request, so an admin of one tenant
+    cannot reach into another by asking nicely.
+    """
+    row = await connection.fetchrow(
+        "SELECT firebase_uid, tenant_id, email FROM admins WHERE firebase_uid = $1",
+        user["uid"],
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is not an administrator",
+        )
+    return {**user, "tenant_id": row["tenant_id"], "admin_email": row["email"]}
+
+
 async def optional_user(authorization: Optional[str] = Header(default=None)) -> Optional[dict]:
     """Dependency for auth-optional endpoints. Returns the decoded token or None."""
     return await _decode_bearer(authorization)

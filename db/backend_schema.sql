@@ -165,3 +165,41 @@ CREATE TABLE IF NOT EXISTS question_explanations (
 
 CREATE INDEX IF NOT EXISTS idx_question_explanations_status
     ON question_explanations (status);
+
+-- Videos, at any level of the tree.
+--
+-- Supersedes chapter_videos. A link that explains one topic belongs on that topic, and
+-- one that covers the whole chapter belongs on the chapter; the old table could only say
+-- chapter. Reads fall back up the tree, so a topic with no video of its own still shows
+-- its chapter's.
+CREATE TABLE IF NOT EXISTS node_videos (
+    node_id       text NOT NULL REFERENCES nodes(node_id),
+    youtube_id    text NOT NULL,
+    tenant_id     text NOT NULL,
+    title         text NOT NULL,
+    channel       text NOT NULL DEFAULT '',
+    thumbnail_url text NOT NULL DEFAULT '',
+    position      integer NOT NULL DEFAULT 0,
+    status        text NOT NULL DEFAULT 'draft',
+    -- Who attached it. An admin panel with no name against each change is a panel nobody
+    -- can be asked about a mistake in.
+    added_by      text NOT NULL DEFAULT '',
+    added_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, youtube_id)
+);
+
+CREATE INDEX IF NOT EXISTS node_videos_lookup
+    ON node_videos (tenant_id, node_id, status, position);
+
+-- Who may write content through the admin panel.
+--
+-- Every student holds a valid Firebase token, so a token alone can never be the check.
+-- Membership is a row here, which means access is granted and revoked with one statement
+-- and is visible to anyone who looks, rather than living in a claim nobody can enumerate.
+CREATE TABLE IF NOT EXISTS admins (
+    firebase_uid text PRIMARY KEY,
+    tenant_id    text NOT NULL,
+    email        text NOT NULL DEFAULT '',
+    note         text NOT NULL DEFAULT '',
+    added_at     timestamptz NOT NULL DEFAULT now()
+);

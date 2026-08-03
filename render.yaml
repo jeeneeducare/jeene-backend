@@ -26,4 +26,4 @@ services:
       # the project are listed because either can serve the same deploy, and both the
       # apex and www of the custom domain because CORS matches an origin exactly.
       - key: JEENE_WEB_ORIGINS
-        value: https://jeene-ff8e3.web.app,https://jeene-ff8e3.firebaseapp.com,https://jeeneeducare.com,https://www.jeeneeducare.com
+        value: https://jeene-ff8e3.web.app,https://jeene-ff8e3.firebaseapp.com,https://jeeneeducare.com,https://www.jeeneeducare.com,https://jeene-admin.web.app,https://jeene-admin.firebaseapp.com

@@ -439,3 +439,35 @@ class ChapterVideo(BaseModel):
     # player can be fixed or moved without an app release, which the three attempts it
     # took to get playback working made a very concrete argument for.
     player_url: str = ""
+
+
+class AdminVideo(BaseModel):
+    """A video as the admin panel sees it: with its status and who attached it."""
+    node_id: str
+    youtube_id: str
+    title: str
+    channel: str = ""
+    thumbnail_url: str = ""
+    position: int = 0
+    status: str = "draft"
+    added_by: str = ""
+    added_at: datetime
+
+
+class AdminNode(BaseModel):
+    """One place in the tree, with whatever hangs off it."""
+    node_id: str
+    type: str
+    title: str
+    videos: list[AdminVideo] = []
+    children: list["AdminNode"] = []
+
+
+class ChapterSummary(BaseModel):
+    node_id: str
+    title: str
+    subject_id: str | None = None
+    subject_title: str = ""
+    class_level: int | None = None
+    status: str = "draft"
+    video_count: int = 0
