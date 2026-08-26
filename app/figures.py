@@ -37,6 +37,12 @@ async def fetch_figures(
     The placement filter is the whole point of the signature, and the default is the
     strictest one: a caller allowed to see more has to say so. Anything not named,
     including a placement this code has never heard of, is withheld. Fail closed.
+
+    Tenant scoping is the caller's, not this function's: `question_figures` has no
+    tenant_id of its own, so a figure belongs to whichever tenant owns its question.
+    Every caller today reaches here with ids from a query filtered on
+    `questions.tenant_id`, which is what makes that safe. If you call this with ids
+    from anywhere else, scope them first (CLAUDE.md rule 6).
     """
     if not question_ids:
         return {}
