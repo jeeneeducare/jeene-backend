@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse
 
 from app.auth import current_tenant, require_user
 from app.db import get_connection
+from app.figures import fetch_figures
 from app.schemas import (
     QuestionExplanation,
     Chapter,
@@ -441,7 +442,7 @@ async def get_question(
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Question '{question_id}' not found")
-    figures = await _fetch_figures(connection, [question_id])
+    figures = await fetch_figures(connection, [question_id])
     return _row_to_question(row, figures)
 
 
@@ -479,7 +480,12 @@ async def get_question_explanation(
         raise HTTPException(
             status_code=404, detail=f"No explanation for '{question_id}' yet"
         )
-    return QuestionExplanation(question_id=row["question_id"], text=row["text"])
+    figures = await fetch_figures(connection, [question_id], placements=("ai_explanation",))
+    return QuestionExplanation(
+        question_id=row["question_id"],
+        text=row["text"],
+        figures=figures.get(question_id, []),
+    )
 
 
 @router.get("/questions/{question_id}/answer", response_model=QuestionAnswer)
@@ -504,6 +510,9 @@ async def get_question_answer(
         "SELECT concept_node_id, is_primary FROM question_concept_mappings WHERE question_id = $1",
         question_id,
     )
+    # The solution's diagrams travel with the solution. This is the first point at which
+    # they may be shown at all, and asking for them has to be explicit.
+    figures = await fetch_figures(connection, [question_id], placements=("explanation",))
     return QuestionAnswer(
         question_id=row["question_id"],
         correct_option_ids=list(row["correct_option_ids"] or []),
@@ -512,6 +521,7 @@ async def get_question_answer(
             ConceptTag(concept_node_id=r["concept_node_id"], is_primary=r["is_primary"])
             for r in concept_rows
         ],
+        figures=figures.get(question_id, []),
     )
 
 
@@ -589,40 +599,13 @@ async def _paginated_questions_for_node_ids(
         offset,
     )
     question_ids = [r["question_id"] for r in rows]
-    figures = await _fetch_figures(connection, question_ids)
+    figures = await fetch_figures(connection, question_ids)
     return PaginatedQuestions(
         items=[_row_to_question(r, figures) for r in rows],
         total=total or 0,
         limit=limit,
         offset=offset,
     )
-
-
-async def _fetch_figures(
-    connection: asyncpg.Connection, question_ids: list[str]
-) -> dict[str, list[QuestionFigure]]:
-    if not question_ids:
-        return {}
-    rows = await connection.fetch(
-        """
-        SELECT question_id, image_url, placement, option_id, caption
-        FROM question_figures
-        WHERE question_id = ANY($1::text[])
-        ORDER BY question_id, display_order
-        """,
-        question_ids,
-    )
-    figures: dict[str, list[QuestionFigure]] = {}
-    for r in rows:
-        figures.setdefault(r["question_id"], []).append(
-            QuestionFigure(
-                image_url=r["image_url"],
-                placement=r["placement"],
-                option_id=r["option_id"],
-                caption=r["caption"],
-            )
-        )
-    return figures
 
 
 def _row_to_question(
