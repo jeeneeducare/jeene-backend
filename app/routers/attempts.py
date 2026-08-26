@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import current_tenant, require_user
 from app.db import get_connection
+from app.figures import SOLUTION_PLACEMENTS, fetch_figures
 from app.schemas import (
     AttemptRequest,
     AttemptResult,
@@ -70,6 +71,14 @@ async def submit_attempt(
     # No row back means this attempt_id was already stored: a retry, not a new answer.
     already_recorded = row is None
 
+    # Gated on exactly the same flag as the solution text, so this can never become a
+    # second, looser door to the answer.
+    figures = (
+        await fetch_figures(connection, [body.question_id], placements=SOLUTION_PLACEMENTS)
+        if body.include_solution
+        else {}
+    )
+
     return AttemptResult(
         attempt_id=body.attempt_id,
         question_id=body.question_id,
@@ -78,6 +87,7 @@ async def submit_attempt(
             list(question["correct_option_ids"] or []) if body.include_solution else None
         ),
         explanation=question["explanation_json"] if body.include_solution else None,
+        figures=figures.get(body.question_id, []),
         already_recorded=already_recorded,
     )
 

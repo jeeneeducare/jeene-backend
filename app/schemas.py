@@ -31,6 +31,11 @@ class QuestionFigure(BaseModel):
     placement: str | None
     option_id: str | None
     caption: str | None
+    # The image's intrinsic size, so the app can hold the right space open while it loads
+    # rather than reflowing the question under the student's thumb. Null for rows ingested
+    # before the pipeline captured it; clients fall back to a default aspect.
+    width: int | None = None
+    height: int | None = None
 
 
 class Question(BaseModel):
@@ -56,6 +61,10 @@ class QuestionAnswer(BaseModel):
     correct_option_ids: list[str]
     explanation: dict[str, Any] | None
     concepts: list[ConceptTag]
+    # The worked solution's own diagrams. They belong here and nowhere earlier: for some
+    # questions the solution's diagram IS the answer, so this endpoint is the only one
+    # allowed to hand them over.
+    figures: list[QuestionFigure] = []
 
 
 class PaginatedQuestions(BaseModel):
@@ -101,6 +110,11 @@ class AttemptResult(BaseModel):
     # Only populated when include_solution was requested.
     correct_option_ids: list[str] | None = None
     explanation: dict[str, Any] | None = None
+    # The solution's own diagrams, on the same terms as the solution text: only when
+    # include_solution was requested. Practice reveals through this endpoint, so without
+    # them a signed-in student would read a worked solution with its diagrams missing
+    # while a signed-out one, who reveals through /answer, would see them.
+    figures: list[QuestionFigure] = []
     # True when this attempt_id was already recorded (a retry), so the client can
     # tell a replay from a fresh grade.
     already_recorded: bool = False
@@ -343,6 +357,10 @@ class QuestionExplanation(BaseModel):
     """
     question_id: str
     text: str
+    # Diagrams belonging to this retelling (placement 'ai_explanation'). Like the worked
+    # solution's, they are part of the answer, so they are served on exactly the same
+    # terms as the text they belong to and never on a question endpoint.
+    figures: list[QuestionFigure] = []
 
 
 class WeakTopic(BaseModel):

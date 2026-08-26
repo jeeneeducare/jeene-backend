@@ -43,8 +43,13 @@ requirements.txt
    `question_concept_mappings`, `question_figures`, `exams`, `exam_syllabus`) — the pipeline owns
    them. The backend writes only its own tables (v1: `users`; later: `attempts`, etc.).
 3. **Answer integrity.** Question-fetch endpoints must never select or return
-   `correct_option_ids` or `explanation_json`. Correct answers and solutions are served only by the
-   dedicated reveal endpoint (and later by server-side grading). This is a correctness rule, not a
+   `correct_option_ids`, `explanation_json`, **or any figure whose `placement` is `explanation`
+   or `ai_explanation`**. A worked solution's diagram is part of the answer, and for some
+   questions it is the answer: one of test 15's questions is answered by the very diagram its
+   solution draws. Correct answers, solutions, and their figures are served only by the
+   dedicated reveal endpoints (and by server-side grading, gated on `include_solution`).
+   Fetch figures through `app/figures.py`, which defaults to the strictest placement set and
+   makes a wider one something a caller has to ask for. This is a correctness rule, not a
    style preference.
 4. **SQL is always parameterized** (`$1`, `$2`, ... with asyncpg). Never build SQL with string
    formatting or f-strings. No exceptions.

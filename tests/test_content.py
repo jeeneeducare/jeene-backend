@@ -1,7 +1,9 @@
+import asyncio
 import os
 
 import pytest
 
+from app.figures import STUDENT_VISIBLE_PLACEMENTS, fetch_figures
 from app.routers.content import _build_tree
 
 
@@ -40,6 +42,97 @@ def test_build_tree_drops_orphans_without_crashing():
     ]
     tree = _build_tree(rows, "ch")
     assert tree.children == []
+
+
+# --- unit tests: a question must never carry the solution's diagram ---
+
+
+class _RecordingConnection:
+    """Just enough asyncpg.Connection to see what SQL a function would run.
+
+    The point is that this needs no database. The rule it guards is a correctness rule,
+    so the test for it should never be one of the ones that silently skips.
+    """
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.calls = []
+
+    async def fetch(self, query, *args):
+        self.calls.append((query, args))
+        return self.rows
+
+
+def test_question_figures_are_restricted_to_what_a_student_may_see():
+    """Some questions are answered by the very diagram their solution draws.
+
+    Before this, /questions returned every figure a question owned, including
+    placement='explanation', and the apps drew anything without an option_id into the
+    stem. A student saw the answer.
+    """
+    connection = _RecordingConnection()
+    asyncio.run(fetch_figures(connection, ["phy_11_ch4_mcq_ncert_q1"]))
+
+    query, args = connection.calls[0]
+    assert "placement = ANY" in query, "the query must filter by placement at all"
+    assert args[1] == ["stem", "option"]
+    assert "explanation" not in args[1]
+    assert "ai_explanation" not in args[1]
+
+
+def test_the_visible_placements_never_grow_to_include_an_answer():
+    """A guard on the constant itself, so widening it has to be deliberate."""
+    assert set(STUDENT_VISIBLE_PLACEMENTS) == {"stem", "option"}
+
+
+def test_each_placement_group_is_disjoint_from_the_ones_a_student_sees():
+    """The groups are what keep the answer on the far side of the reveal."""
+    from app.figures import ALL_PLACEMENTS, AI_EXPLANATION_PLACEMENTS, SOLUTION_PLACEMENTS
+
+    student = set(STUDENT_VISIBLE_PLACEMENTS)
+    assert not student & set(SOLUTION_PLACEMENTS)
+    assert not student & set(AI_EXPLANATION_PLACEMENTS)
+    # ALL_PLACEMENTS is the only one that may overlap, and only the review uses it.
+    assert student <= set(ALL_PLACEMENTS)
+
+
+def test_figures_come_back_grouped_by_option_and_in_display_order():
+    """A question with figures on several options must not interleave them."""
+    connection = _RecordingConnection()
+    asyncio.run(fetch_figures(connection, ["q1"]))
+    query = connection.calls[0][0]
+    assert "ORDER BY" in query
+    assert "option_id" in query.split("ORDER BY")[1]
+    assert "display_order" in query.split("ORDER BY")[1]
+
+
+def test_the_paper_builder_filters_by_allowlist_not_by_naming_one_placement():
+    """A denylist here silently reopened once, when a new placement was added.
+
+    The paper a candidate sits must carry stem and option diagrams and nothing else. Written
+    as "everything except explanation", adding 'ai_explanation' quietly let a solution's
+    diagram back into a live paper.
+    """
+    import inspect
+
+    from app.routers import tests as tests_router
+
+    source = inspect.getsource(tests_router._paper_for)
+    assert "in STUDENT_VISIBLE_PLACEMENTS" in source
+    assert 'placement != "explanation"' not in source
+
+
+def test_a_caller_may_ask_for_the_solutions_figures_explicitly():
+    """The reveal endpoint is allowed to see them; it just has to say so."""
+    connection = _RecordingConnection()
+    asyncio.run(fetch_figures(connection, ["q1"], placements=("explanation",)))
+    assert connection.calls[0][1][1] == ["explanation"]
+
+
+def test_no_question_ids_means_no_query_at_all():
+    connection = _RecordingConnection()
+    assert asyncio.run(fetch_figures(connection, [])) == {}
+    assert connection.calls == []
 
 
 # --- integration tests: hit the real endpoints against Supabase ---

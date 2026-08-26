@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
+from app.figures import ALL_PLACEMENTS, STUDENT_VISIBLE_PLACEMENTS, fetch_figures
 from app.schemas import (
     QuestionFigure,
     QuestionResult,
@@ -135,36 +136,28 @@ async def _paper_for(connection, test_id: str, tenant: str) -> list[dict]:
         # Stem and option diagrams only. A worked solution's figure is part of the
         # answer, and the paper must not carry any part of the answer: one of test
         # 15's questions is answered by the very diagram its solution draws.
+        #
+        # Named as an allowlist, not "everything except explanation". It was the latter
+        # once, which meant adding the 'ai_explanation' placement silently opened a second
+        # way for a solution's diagram to reach a candidate mid-paper. A placement this
+        # code has not heard of is withheld.
         question["figures"] = [
             f for f in figures.get(question["question_id"], [])
-            if f.placement != "explanation"
+            if f.placement in STUDENT_VISIBLE_PLACEMENTS
         ]
     return paper
 
 
 async def _figures_for(connection, question_ids: list[str]) -> dict[str, list[QuestionFigure]]:
-    """Diagrams by question id. A question that references a figure it cannot show is
-    unanswerable, so these travel with the paper rather than being fetched per question."""
-    if not question_ids:
-        return {}
-    rows = await connection.fetch(
-        """
-        SELECT question_id, image_url, placement, option_id, caption
-        FROM question_figures
-        WHERE question_id = ANY($1::text[])
-        ORDER BY question_id, display_order
-        """,
-        question_ids,
-    )
-    figures: dict[str, list[QuestionFigure]] = {}
-    for r in rows:
-        figures.setdefault(r["question_id"], []).append(
-            QuestionFigure(
-                image_url=r["image_url"], placement=r["placement"],
-                option_id=r["option_id"], caption=r["caption"],
-            )
-        )
-    return figures
+    """Every diagram a paper's questions own, the solution's included.
+
+    Unfiltered on purpose, and safe only because of what the two callers do with it: the
+    paper builder strips the solution's diagrams before a student sees the paper, and the
+    review builder runs only after the sitting is submitted. A question that references a
+    figure it cannot show is unanswerable, so these travel with the paper rather than being
+    fetched one at a time.
+    """
+    return await fetch_figures(connection, question_ids, placements=ALL_PLACEMENTS)
 
 
 @router.post("/tests/{test_id}/sessions", response_model=TestSession)
