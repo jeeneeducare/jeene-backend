@@ -4,7 +4,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
-from app.auth import current_tenant, require_user
+from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
 from app.figures import fetch_figures
 from app.visibility import NOT_UNRELEASED_TEST_SQL
@@ -97,6 +97,10 @@ async def list_chapter_questions(
     node_ids = [r["node_id"] for r in rows]
     return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
 
+
+# What `difficulty` accepts. `unrated` is not a value in the column — it is the name
+# the study planner uses for an ungraded question, translated to IS NULL downstream.
+_DIFFICULTIES = {"easy", "medium", "hard", "unrated"}
 
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -402,8 +406,23 @@ async def chapter_history(
 @router.get("/concepts/{concept_id}/questions", response_model=PaginatedQuestions)
 async def list_concept_questions(
     concept_id: str,
+    difficulty: list[str] | None = Query(
+        default=None,
+        description=(
+            "Restrict to these difficulties. Repeatable. `unrated` selects questions the "
+            "pipeline has not graded. Omit for all."
+        ),
+    ),
+    exclude_seen: bool = Query(
+        default=False,
+        description=(
+            "Skip questions this student has already answered. Ignored when signed out, "
+            "since an anonymous caller has no history to skip."
+        ),
+    ),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    user: dict | None = Depends(optional_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> PaginatedQuestions:
@@ -414,7 +433,27 @@ async def list_concept_questions(
     )
     if not exists:
         raise HTTPException(status_code=404, detail=f"Concept '{concept_id}' not found")
-    return await _paginated_questions_for_node_ids(connection, [concept_id], limit, offset, tenant)
+    if difficulty:
+        unknown = sorted(set(difficulty) - _DIFFICULTIES)
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Unknown difficulty {unknown}. Expected any of "
+                    f"{sorted(_DIFFICULTIES)}."
+                ),
+            )
+    return await _paginated_questions_for_node_ids(
+        connection,
+        [concept_id],
+        limit,
+        offset,
+        tenant,
+        difficulty=difficulty,
+        # A signed-out caller has no history, so the flag is simply nothing to apply
+        # rather than an error — the practice deck is open to anonymous browsing.
+        exclude_seen_for=(user or {}).get("uid") if exclude_seen else None,
+    )
 
 
 @router.get("/questions/{question_id}", response_model=Question)
@@ -563,17 +602,47 @@ def _build_tree(rows: list[asyncpg.Record], chapter_id: str) -> TreeNode:
 
 
 async def _paginated_questions_for_node_ids(
-    connection: asyncpg.Connection, node_ids: list[str], limit: int, offset: int, tenant: str
+    connection: asyncpg.Connection,
+    node_ids: list[str],
+    limit: int,
+    offset: int,
+    tenant: str,
+    difficulty: list[str] | None = None,
+    exclude_seen_for: str | None = None,
 ) -> PaginatedQuestions:
+    """A page of the questions tagged to these nodes.
+
+    The two optional filters exist for the study planner, which needs "medium questions
+    on these concepts that this student has not met". Both default to off, so the two
+    existing callers behave exactly as they did.
+
+    `difficulty` may include `unrated`, which is not a value in the column but the name
+    the planner uses for a question the pipeline has not graded — so it is translated to
+    an IS NULL here rather than compared as a string.
+    """
+    graded = [d for d in (difficulty or []) if d != "unrated"] or None
+    allow_unrated = "unrated" in (difficulty or [])
+    # Written once and shared by the count and the page, because a total that disagrees
+    # with the rows underneath it is worse than no total.
+    filters = """
+          AND ($3::text[] IS NULL OR q.difficulty = ANY($3::text[])
+               OR ($4::bool AND q.difficulty IS NULL))
+          AND ($5::text IS NULL OR NOT EXISTS (
+                SELECT 1 FROM attempts a
+                 WHERE a.question_id = q.question_id AND a.firebase_uid = $5))
+    """
     total = await connection.fetchval(
         """
         SELECT COUNT(DISTINCT q.question_id)
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
-        """ + _NOT_UNRELEASED_TEST,
+        """ + _NOT_UNRELEASED_TEST + filters,
         tenant,
         node_ids,
+        graded,
+        allow_unrated,
+        exclude_seen_for,
     )
     rows = await connection.fetch(
         """
@@ -584,12 +653,15 @@ async def _paginated_questions_for_node_ids(
         FROM questions q
         JOIN question_concept_mappings qcm ON qcm.question_id = q.question_id
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
-        """ + _NOT_UNRELEASED_TEST + """
+        """ + _NOT_UNRELEASED_TEST + filters + """
         ORDER BY q.question_id
-        LIMIT $3 OFFSET $4
+        LIMIT $6 OFFSET $7
         """,
         tenant,
         node_ids,
+        graded,
+        allow_unrated,
+        exclude_seen_for,
         limit,
         offset,
     )
