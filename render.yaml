@@ -20,6 +20,26 @@ services:
       # is here for the day generation moves onto a server rather than a laptop.
       - key: DEEPSEEK_API_KEY
         sync: false
+      # --- Jeene Mode -------------------------------------------------------------
+      # The study planner. All three are optional and their absence is not an error:
+      # with no key, or with the flag off, every plan comes from the deterministic
+      # planner and no network call is made. That is a supported configuration, and it
+      # is the one to fall back to if the model ever misbehaves in production.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: JEENE_PLANNER_MODEL
+        sync: false
+      - key: JEENE_PLANNER_ENABLED
+        sync: false
+      # Signs the short-lived links the app uses to open the notes viewer. Generate once
+      # with `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+      #
+      # Not optional in a deployment. Without it every worker signs with its own random
+      # secret, so a link minted by one worker is refused by another and the notes fail
+      # to open for roughly (workers - 1)/workers of requests — intermittently, which is
+      # the worst way for it to fail.
+      - key: JEENE_ASSET_SECRET
+        sync: false
       # Origins allowed to drive a test sitting from a browser. Explicit rather than
       # a wildcard: these endpoints accept a credential, and any site permitted here
       # could sit a paper on a student's behalf. Both Firebase Hosting domains for
