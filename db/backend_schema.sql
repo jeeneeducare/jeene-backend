@@ -221,3 +221,148 @@ CREATE TABLE IF NOT EXISTS admin_invites (
     invited_by text NOT NULL DEFAULT '',
     invited_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------------
+-- Jeene Mode: a student's route through one scope.
+--
+-- A plan is keyed to a *scope node* of any plannable type, not to a chapter. A plan
+-- that pulls in a prerequisite from an earlier chapter is the normal case rather than
+-- the exception, so "which chapter is this plan about" is a question with no answer and
+-- the schema does not pretend otherwise.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS study_plans (
+  plan_id           UUID PRIMARY KEY,
+  firebase_uid      TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
+  tenant_id         TEXT NOT NULL REFERENCES tenants(tenant_id),
+
+  scope_node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+  scope_type        TEXT NOT NULL CHECK (scope_type IN ('chapter', 'topic', 'subtopic')),
+  -- Denormalised on purpose: a plan made in August must still read correctly after the
+  -- tree is retitled in September.
+  scope_title       TEXT NOT NULL,
+
+  proficiency       TEXT NOT NULL
+                    CHECK (proficiency IN ('basic', 'intermediate', 'advanced')),
+  intent            TEXT NOT NULL
+                    CHECK (intent IN ('first_time', 'revising', 'exam_soon')),
+
+  -- How this plan was produced, so "why did this student get a thin plan" is answerable
+  -- without guessing. 'fallback' is the deterministic planner, which is not a failure
+  -- state — it is what runs whenever no model is configured.
+  origin            TEXT NOT NULL CHECK (origin IN ('model', 'fallback', 'remediation')),
+  provider          TEXT,
+  model             TEXT,
+  -- The rubric version that produced it. Improving the prompt is a deliberate act: bump
+  -- this and you can find and regenerate exactly the cohort the old one wrote, rather
+  -- than leaving a mixed population with no way to tell which is which. The same
+  -- discipline question_explanations already uses.
+  prompt_version    INTEGER NOT NULL,
+  -- Accuracy over the scope when the plan was written. Staleness is measured against it.
+  accuracy_at_generation NUMERIC,
+
+  status            TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'completed', 'archived')),
+  completed_at      TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_study_plans_user
+  ON study_plans (firebase_uid, status, updated_at DESC);
+
+-- Asking for the same scope twice resumes rather than forks. Without this a student who
+-- taps "Plan this" again gets a second plan, and their finished steps appear to vanish.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_study_plans_active_scope
+  ON study_plans (firebase_uid, scope_node_id) WHERE status = 'active';
+
+
+-- One step of a plan. Ordered by `position` and rendered as a rail, but stored as a DAG:
+-- `depends_on` costs nothing now and means the graph view later is a rendering change
+-- rather than a migration. Foundation steps really are a branch that rejoins, so the DAG
+-- is also the more honest shape.
+CREATE TABLE IF NOT EXISTS study_plan_steps (
+  step_id        UUID PRIMARY KEY,
+  plan_id        UUID NOT NULL REFERENCES study_plans(plan_id) ON DELETE CASCADE,
+  position       INTEGER NOT NULL,
+  kind           TEXT NOT NULL
+                 CHECK (kind IN ('learn', 'practise', 'verify', 'consolidate')),
+
+  title          TEXT NOT NULL,
+  why            TEXT NOT NULL,
+  -- The instructions. This is the feature: a step that names material without saying how
+  -- to use it is a link, and the student already had links.
+  how_to_use     TEXT[] NOT NULL,
+  focus_node_ids TEXT[] NOT NULL DEFAULT '{}',
+  is_foundation  BOOLEAN NOT NULL DEFAULT false,
+  depends_on     UUID[] NOT NULL DEFAULT '{}',
+  estimated_minutes INTEGER,
+
+  -- How the step is judged done. 'self' is the only one a tap can satisfy, and it is
+  -- allowed only where there is genuinely nothing to measure — reading and watching.
+  -- Everything else is derived from the attempt log in JM-3.
+  completion_kind    TEXT NOT NULL
+                     CHECK (completion_kind IN ('self', 'accuracy', 'checkpoint')),
+  required_questions INTEGER,
+  required_accuracy  NUMERIC,
+  CONSTRAINT graded_steps_state_their_bar CHECK (
+    completion_kind = 'self'
+    OR (required_questions IS NOT NULL AND required_accuracy IS NOT NULL)
+  ),
+
+  state          TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (state IN ('pending', 'in_progress', 'done', 'skipped')),
+  completed_at   TIMESTAMPTZ,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (plan_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON study_plan_steps (plan_id, position);
+
+
+-- One item inside a step: either a named reference or a question selector, never both.
+--
+-- That split is the content boundary showing through into the schema. Videos and notes
+-- are few and individually meaningful, so a plan names them. Questions are many and
+-- interchangeable, so a plan describes a filter and the backend resolves it — which is
+-- why no column here can hold a question id the planner chose.
+CREATE TABLE IF NOT EXISTS study_plan_step_items (
+  item_id      UUID PRIMARY KEY,
+  step_id      UUID NOT NULL REFERENCES study_plan_steps(step_id) ON DELETE CASCADE,
+  position     INTEGER NOT NULL,
+  item_type    TEXT NOT NULL
+               CHECK (item_type IN ('video', 'notes', 'test', 'questions')),
+
+  ref_node_id  TEXT,
+  ref_id       TEXT,
+
+  sel_concept_ids  TEXT[],
+  sel_types        TEXT[],
+  sel_difficulty   TEXT[],
+  sel_count        INTEGER,
+  sel_order        TEXT CHECK (sel_order IN ('easiest_first', 'mixed', 'hardest_first')),
+  sel_exclude_seen BOOLEAN NOT NULL DEFAULT false,
+
+  -- Frozen on first open (JM-3). The selector is the plan; this is the sitting. Without
+  -- it the deck reshuffles between visits and "6 of 8 right" stops meaning anything.
+  resolved_question_ids TEXT[],
+  resolved_at  TIMESTAMPTZ,
+
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  CONSTRAINT item_is_a_reference_or_a_selector CHECK (
+    (item_type = 'questions' AND sel_count IS NOT NULL AND ref_id IS NULL)
+    OR (item_type <> 'questions' AND ref_id IS NOT NULL AND sel_count IS NULL)
+  ),
+
+  UNIQUE (step_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_items_step ON study_plan_step_items (step_id, position);
+
+
+-- How long a lecture runs. Without it a step cannot say "watch to 6:40" and cannot
+-- estimate honestly, so the planner has been writing duration-free guidance. Nullable
+-- and backfilled through the admin path; the inventory reads it once it is populated.
+ALTER TABLE node_videos ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
