@@ -62,7 +62,10 @@ def main() -> int:
     port = int(os.environ.get("JEENE_DEV_PORT", "8000"))
     print(f"!! NO AUTHENTICATION — every request is {uid!r} on tenant {tenant!r}")
     print(f"!! local only, http://127.0.0.1:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    # Quiet by default; set JEENE_DEV_LOG_LEVEL=info to see every request, which is
+    # the only way to tell "the app never asked" from "the app asked and we said no".
+    level = os.environ.get("JEENE_DEV_LOG_LEVEL", "warning")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level=level)
     return 0
 
 
