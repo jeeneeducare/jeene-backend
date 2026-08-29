@@ -277,6 +277,42 @@ async def touch(connection: asyncpg.Connection, plan_id) -> None:
     )
 
 
+async def clamp_required_questions(
+    connection: asyncpg.Connection, step_id, available: int
+) -> int | None:
+    """Bring a graded step's bar down to what its questions can actually satisfy.
+
+    The planner sets `required_questions` against the number it *asked* a selector for.
+    The selector then resolves against what is published, and it can find fewer — the
+    shortfall is expected and `freeze_item` logs it. But the completion rule is
+    `answered >= required_questions`, so a step asking for nine with eight frozen is not
+    merely mislabelled: it can never be finished, and the plan that contains it can never
+    complete. Measured live, planned 9 and froze 8.
+
+    Done once, at freeze time, rather than as a `min()` inside the progress rule, because
+    the number is also *read* — the step card tells the student "answer 9 of these" above
+    a deck of eight. One stored truth beats two readers agreeing to correct it.
+
+    Returns the new bar, or None when nothing needed changing. Never lowers it to zero: a
+    step whose selector found nothing keeps its bar and stays unfinishable, which is what
+    JM-4 skips over, rather than becoming completable by a single answer.
+    """
+    if available <= 0:
+        return None
+    return await connection.fetchval(
+        """
+        UPDATE study_plan_steps
+           SET required_questions = $2
+         WHERE step_id = $1::uuid
+           AND completion_kind <> 'self'
+           AND required_questions IS NOT NULL
+           AND required_questions > $2
+        RETURNING required_questions
+        """,
+        str(step_id), available,
+    )
+
+
 # Every step of these plans with the student's answers against its frozen questions.
 #
 # One query, because the history screen derives every step of every plan and doing that a

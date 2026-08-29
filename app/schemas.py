@@ -438,8 +438,13 @@ class ChapterNotes(BaseModel):
     chapter_id: str
     title: str
     pdf_url: str
-    page_count: int
-    size_bytes: int
+    # Both nullable in the table, and so both nullable here. They were declared required,
+    # which meant a published row whose size had not been recorded made the endpoint 500
+    # rather than answer — found the first time a client actually called it, which was
+    # the app opening a plan step that pointed at notes. A response model has to describe
+    # the column it reads, not the column somebody meant to write.
+    page_count: int | None = None
+    size_bytes: int | None = None
 
 
 class ChapterVideo(BaseModel):

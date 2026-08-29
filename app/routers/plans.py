@@ -167,12 +167,19 @@ async def get_plan(
         items_by_step[current["step_id"]] = await store.items_for(
             connection, [current["step_id"]]
         )
+        frozen = _frozen_ids(items_by_step[current["step_id"]])
+        # Now that the real count is known, the step's bar cannot ask for more than that.
+        lowered = await store.clamp_required_questions(
+            connection, current["step_id"], len(frozen)
+        )
+        if lowered is not None:
+            current = dict(current) | {"required_questions": lowered}
         progress = await step_progress(
             connection,
             tenant,
             user["uid"],
             current,
-            _frozen_ids(items_by_step[current["step_id"]]),
+            frozen,
         )
         by_step[current["step_id"]] = (
             progress.state,
@@ -211,6 +218,10 @@ async def step_items(
     items = await store.items_for(connection, [step["step_id"]])
 
     question_ids = _frozen_ids(items)
+    # Same clamp as the plan read, because either can be the first to freeze this step.
+    await store.clamp_required_questions(
+        connection, step["step_id"], len(question_ids)
+    )
     # No progress read here on purpose. The client refreshes the plan when it closes the
     # sheet, which is where the updated "4 of 8 right" belongs; computing it now would be
     # a query for a number that is stale by the time the student answers anything.

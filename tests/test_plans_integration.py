@@ -570,3 +570,66 @@ def test_the_hourly_limit_leaves_room_to_replace_a_plan(client):
 
     assert store.MAX_PLANS_PER_HOUR > store.MAX_ACTIVE_PLANS
     assert store.MAX_PLANS_PER_DAY >= store.MAX_PLANS_PER_HOUR
+
+
+@integration
+def test_a_step_never_asks_for_more_questions_than_it_has(client):
+    """`required_questions` is set against what the planner asked for; freezing finds what
+    exists, and it can be fewer.
+
+    That is not a labelling problem. Completion is `answered >= required_questions`, so a
+    step asking for nine with eight frozen can never be done and the plan containing it
+    can never complete — while the card cheerfully tells the student to answer nine of
+    eight. Seen live on a real plan: planned 9, froze 8.
+
+    The bar is forced here rather than waited for. Whether a given generated plan happens
+    to overshoot is up to the model and the catalogue, and a test that only fails when it
+    does is a test that passes for the wrong reason — this one was written that way first
+    and went green with the fix removed.
+    """
+    _as(client, FRESH)
+    plan = client.post(
+        "/plans",
+        json={"scope_node_id": SCOPE, "proficiency": "basic", "intent": "first_time"},
+    ).json()
+
+    graded = next(
+        s for s in plan["steps"]
+        if s["completion_kind"] != "self" and s["required_questions"] is not None
+    )
+    import asyncio
+
+    import asyncpg
+
+    async def force_impossible_bar():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "UPDATE study_plan_steps SET required_questions = 999 "
+                "WHERE step_id = $1::uuid",
+                graded["step_id"],
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(force_impossible_bar())
+
+    opened = client.get(
+        f"/plans/{plan['plan_id']}/steps/{graded['step_id']}/items"
+    ).json()
+    frozen = sum(
+        item["question_count"] or 0
+        for item in opened["items"]
+        if item["question_count"] is not None
+    )
+    assert frozen > 0, "nothing froze; the test proved nothing"
+
+    reread = next(
+        s for s in client.get(f"/plans/{plan['plan_id']}").json()["steps"]
+        if s["step_id"] == graded["step_id"]
+    )
+    assert reread["required_questions"] == frozen, (
+        f"asks for {reread['required_questions']} of {frozen} questions, "
+        "which can never be answered"
+    )
+    _as(client, STUDENT)

@@ -338,3 +338,41 @@ def test_the_player_page_carries_the_id_and_a_real_origin():
     # The whole reason this page exists rather than a hand-written iframe.
     assert "https://www.youtube.com/iframe_api" in page
     assert "onError" in page
+
+
+# --- chapter notes --------------------------------------------------------------------
+
+def test_notes_survive_a_row_that_never_recorded_its_size():
+    """`page_count` and `size_bytes` are nullable columns, so the model must allow null.
+
+    They were declared required. A published row whose size had not been recorded made
+    `GET /chapters/{id}/notes` raise a validation error and answer 500 — and because
+    nothing had ever called the endpoint, it stayed that way until a plan step pointed at
+    notes and the app opened it.
+    """
+    from app.schemas import ChapterNotes
+
+    notes = ChapterNotes(
+        **{
+            "chapter_id": "phy_11_ch8",
+            "title": "Gravitation — chapter notes",
+            "pdf_url": "https://cdn.example/notes.pdf",
+            "page_count": 14,
+            "size_bytes": None,
+        }
+    )
+
+    assert notes.size_bytes is None
+    assert notes.page_count == 14
+
+
+def test_notes_still_require_the_things_a_reader_cannot_do_without():
+    """Nullable is not the same as optional everywhere. Without a URL there is nothing
+    to open, and a row like that is a content bug worth failing loudly on."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.schemas import ChapterNotes
+
+    with pytest.raises(ValidationError):
+        ChapterNotes(chapter_id="phy_11_ch8", title="Gravitation", page_count=14)
