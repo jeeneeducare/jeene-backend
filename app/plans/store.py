@@ -130,7 +130,7 @@ async def steps_for(connection: asyncpg.Connection, plan_id) -> list:
         SELECT step_id, plan_id, position, kind, title, why, how_to_use,
                focus_node_ids, is_foundation, depends_on, estimated_minutes,
                completion_kind, required_questions, required_accuracy, state,
-               completed_at
+               completed_at, remediation_round
           FROM study_plan_steps
          WHERE plan_id = $1::uuid
          ORDER BY position
@@ -274,6 +274,153 @@ async def touch(connection: asyncpg.Connection, plan_id) -> None:
     await connection.execute(
         "UPDATE study_plans SET updated_at = now() WHERE plan_id = $1::uuid",
         str(plan_id),
+    )
+
+
+async def remediation_round(connection: asyncpg.Connection, plan_id) -> int:
+    """How many times this plan has already grown itself. Zero for a plan as written."""
+    return await connection.fetchval(
+        "SELECT coalesce(max(remediation_round), 0) FROM study_plan_steps "
+        "WHERE plan_id = $1::uuid",
+        str(plan_id),
+    )
+
+
+async def remediated_concepts(connection: asyncpg.Connection, plan_id) -> set[str]:
+    """Concepts this plan already has a remediation step for.
+
+    A second round should not re-add work the plan is already carrying. A student who
+    missed "variation with depth" twice, without having done the step the first miss
+    produced, does not need two identical steps — they need the one they already have,
+    and a rail with the same title twice reads as a bug rather than as emphasis.
+
+    Deliberately not "not done yet". If they *did* the step and still missed the concept,
+    another copy of it is not the answer either; that is what the round cap is for.
+    """
+    rows = await connection.fetch(
+        """
+        SELECT unnest(focus_node_ids) AS node_id
+          FROM study_plan_steps
+         WHERE plan_id = $1::uuid AND remediation_round > 0
+        """,
+        str(plan_id),
+    )
+    return {r["node_id"] for r in rows}
+
+
+async def append_remediation(
+    connection: asyncpg.Connection, plan_id, steps: list, round_number: int
+) -> list:
+    """Insert these steps immediately before the checkpoint, and return their rows.
+
+    Before rather than after, because the checkpoint is the end of the plan by
+    definition: work that comes after the thing that decides whether you are finished is
+    work nobody will do. Everything from the checkpoint onwards shifts down.
+
+    One transaction with the position shift. Half of this applied is a plan with two
+    steps at the same position, which is a rail that renders in an order nobody chose.
+    """
+    if not steps:
+        return []
+
+    checkpoint_position = await connection.fetchval(
+        """
+        SELECT min(position) FROM study_plan_steps
+         WHERE plan_id = $1::uuid AND completion_kind = 'checkpoint'
+        """,
+        str(plan_id),
+    )
+    if checkpoint_position is None:
+        # No checkpoint to sit in front of. Nothing here is safe to guess at, and a plan
+        # without one cannot have failed a check in the first place.
+        return []
+
+    step_ids = [uuid.uuid4() for _ in steps]
+    async with connection.transaction():
+        await connection.execute(
+            """
+            UPDATE study_plan_steps
+               SET position = position + $3
+             WHERE plan_id = $1::uuid AND position >= $2
+            """,
+            str(plan_id), checkpoint_position, len(steps),
+        )
+        for offset, (step_id, step) in enumerate(zip(step_ids, steps)):
+            await connection.execute(
+                """
+                INSERT INTO study_plan_steps (
+                    step_id, plan_id, position, kind, title, why, how_to_use,
+                    focus_node_ids, is_foundation, depends_on, estimated_minutes,
+                    completion_kind, required_questions, required_accuracy,
+                    remediation_round
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                          $15)
+                """,
+                step_id, str(plan_id), checkpoint_position + offset, step.kind,
+                step.title, step.why, list(step.how_to_use), list(step.focus_node_ids),
+                step.is_foundation,
+                # Deliberately no dependencies. These are inserted into a plan whose
+                # steps already point at each other by id, and inventing edges into that
+                # graph from here would be guessing at a shape somebody else wrote.
+                [],
+                step.estimated_minutes, step.completion.kind,
+                step.completion.required_questions, step.completion.required_accuracy,
+                round_number,
+            )
+            for item_position, item in enumerate(step.items):
+                selector = item.selector
+                await connection.execute(
+                    """
+                    INSERT INTO study_plan_step_items (
+                        item_id, step_id, position, item_type, ref_node_id, ref_id,
+                        sel_concept_ids, sel_types, sel_difficulty, sel_count,
+                        sel_order, sel_exclude_seen
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    """,
+                    uuid.uuid4(), step_id, item_position, item.type, None,
+                    item.video_id or item.notes_chapter_id or item.test_id,
+                    list(selector.concept_node_ids) if selector else None,
+                    list(selector.question_types) if selector else None,
+                    list(selector.difficulty) if selector else None,
+                    selector.count if selector else None,
+                    selector.order if selector else None,
+                    selector.exclude_seen if selector else None,
+                )
+        await touch(connection, plan_id)
+
+    return await connection.fetch(
+        """
+        SELECT step_id, plan_id, position, kind, title, why, how_to_use,
+               focus_node_ids, is_foundation, depends_on, estimated_minutes,
+               completion_kind, required_questions, required_accuracy, state,
+               completed_at, remediation_round
+          FROM study_plan_steps
+         WHERE step_id = ANY($1::uuid[])
+         ORDER BY position
+        """,
+        step_ids,
+    )
+
+
+async def reopen_checkpoint(connection: asyncpg.Connection, step_id) -> None:
+    """Throw away the checkpoint's frozen questions so a retake draws unseen ones.
+
+    Without this a second attempt is the same eight questions whose answers the student
+    has just read, and passing it would mean nothing at all. The selector already carries
+    `exclude_seen` — the validator forces it onto every checkpoint — so simply clearing
+    the freeze is enough to get a fresh set.
+
+    The attempts stay. They are the record of what happened, they are what the
+    remediation was built from, and deleting them to make a number look better is the one
+    thing an attempt log must never do.
+    """
+    await connection.execute(
+        """
+        UPDATE study_plan_step_items
+           SET resolved_question_ids = NULL, resolved_at = NULL
+         WHERE step_id = $1::uuid
+        """,
+        str(step_id),
     )
 
 

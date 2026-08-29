@@ -406,4 +406,12 @@ CREATE INDEX IF NOT EXISTS idx_plan_items_step ON study_plan_step_items (step_id
 -- How long a lecture runs. Without it a step cannot say "watch to 6:40" and cannot
 -- estimate honestly, so the planner has been writing duration-free guidance. Nullable
 -- and backfilled through the admin path; the inventory reads it once it is populated.
+-- Which round of remediation added a step. Zero for everything the planner wrote; one
+-- for the work appended after the first missed checkpoint, and so on. Stored rather than
+-- inferred because it is the only thing bounding how far a plan can grow — and because a
+-- student is owed the difference between "this was always the plan" and "this appeared
+-- because of your check".
+ALTER TABLE study_plan_steps
+  ADD COLUMN IF NOT EXISTS remediation_round INTEGER NOT NULL DEFAULT 0;
+
 ALTER TABLE node_videos ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;

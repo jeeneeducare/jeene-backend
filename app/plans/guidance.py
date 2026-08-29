@@ -40,6 +40,7 @@ Role = Literal[
     "exam_shape",
     "consolidate",
     "checkpoint",
+    "remediation",
 ]
 
 ROLE_KIND: dict[Role, StepKind] = {
@@ -50,11 +51,34 @@ ROLE_KIND: dict[Role, StepKind] = {
     "exam_shape": "practise",
     "consolidate": "consolidate",
     "checkpoint": "verify",
+    "remediation": "practise",
 }
 
 _DEFAULT_INTENT: Intent = "first_time"
 
 GUIDANCE: dict[Role, dict[Intent, list[str]]] = {
+    # Added after a missed checkpoint, on the concepts the check itself found. The
+    # difference from `weak_spots` is what the student has just been through: they have
+    # an answer sheet in front of them and a specific disappointment, so this says what
+    # to do with both rather than starting from "your record suggests".
+    "remediation": {
+        "first_time": [
+            "These are the ideas the check found, not the whole topic again.",
+            "Before you answer anything, go back to the ones you got wrong in the check "
+            "and write down what you thought the answer was and why.",
+            "Then work through these. If you get one wrong for the same reason, that is "
+            "the thing to fix — not the question.",
+        ],
+        "revising": [
+            "Short and specific: only what the check said was not there yet.",
+            "Do them in one sitting, then re-take the check.",
+        ],
+        "exam_soon": [
+            "The check found these, so they are worth more of your remaining time than "
+            "anything you already get right.",
+            "Answer them, then go straight back to the check.",
+        ],
+    },
     "foundation": {
         "first_time": [
             "This is groundwork from an earlier chapter, not the topic you asked about.",

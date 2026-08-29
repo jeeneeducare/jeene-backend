@@ -568,6 +568,10 @@ class PlanStep(BaseModel):
     how_to_use: list[str] = []
     focus_node_ids: list[str] = []
     is_foundation: bool = False
+    # Zero for everything the plan was written with; one or more for work appended after
+    # a missed checkpoint. The app marks those, because "this appeared because of your
+    # check" is a different thing to read than "this was always the plan".
+    remediation_round: int = 0
     depends_on: list[str] = []
     estimated_minutes: int | None = None
 

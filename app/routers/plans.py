@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.auth import current_tenant, require_admin, require_user
 from app.config import settings
 from app.db import get_connection
-from app.plans import store
+from app.plans import remediate, store
 from app.plans.generate import generate
 from app.plans.prompt import PROMPT_VERSION
 from app.plans.inventory import build_inventory
@@ -379,6 +379,7 @@ async def skip_step(
 @router.post("/{plan_id}/checkpoint/submit", response_model=CheckpointResult)
 async def submit_checkpoint(
     plan_id: str,
+    request: Request,
     user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
@@ -388,9 +389,11 @@ async def submit_checkpoint(
     Nothing is graded here — the answers were graded by `POST /attempts` as they were
     given. This reads the result, and completes the plan when everything else is done.
 
-    A miss does not fail the plan. In JM-10 it appends work on the concepts that were
-    missed; until then the step simply stays open, which is the same outcome one round
-    later and never a worse one.
+    A miss does not fail the plan and does not leave it where it was. It appends work on
+    the concepts the check itself found, and clears the checkpoint so a retake draws
+    questions the student has not met — because the alternative is a locked door whose
+    only key is answering the questions whose answers they have just read. See
+    `app/plans/remediate.py`.
     """
     plan = await store.get_plan(connection, plan_id, user["uid"])
     if plan is None:
@@ -422,10 +425,24 @@ async def submit_checkpoint(
     ]
 
     status = plan["status"]
-    if plan_is_complete(states) and status == "active":
-        await store.set_plan_status(connection, plan_id, "completed")
-        status = "completed"
+    added: list = []
+    if progress.state == "done":
+        if plan_is_complete(states) and status == "active":
+            await store.set_plan_status(connection, plan_id, "completed")
+            status = "completed"
+        else:
+            await store.touch(connection, plan_id)
     else:
+        added = await _remediate(
+            connection,
+            plan_id=plan_id,
+            tenant=tenant,
+            firebase_uid=user["uid"],
+            plan=plan,
+            checkpoint=checkpoint,
+            checkpoint_items=items,
+            question_ids=_frozen_ids(items),
+        )
         await store.touch(connection, plan_id)
 
     return CheckpointResult(
@@ -442,7 +459,76 @@ async def submit_checkpoint(
         ),
         passed=progress.state == "done",
         plan_status=status,
+        added_steps=[_step(row, [], ("pending", 0, 0), request) for row in added],
     )
+
+
+async def _remediate(
+    connection: asyncpg.Connection,
+    *,
+    plan_id: str,
+    tenant: str,
+    firebase_uid: str,
+    plan,
+    checkpoint,
+    checkpoint_items: list,
+    question_ids: list[str],
+) -> list:
+    """Grow the plan around what the check found, and reopen the check.
+
+    Both halves matter and neither is much use alone: work with no fresh checkpoint is
+    unmeasured, and a fresh checkpoint with no work is the same test again.
+
+    Capped. Past the limit the checkpoint is still reopened — a student is always allowed
+    another honest attempt — but the plan stops growing, because at some point more
+    questions is not the answer and pretending otherwise wastes their evening.
+    """
+    round_number = await store.remediation_round(connection, plan_id) + 1
+    missed = await remediate.missed_concepts(
+        connection, tenant, firebase_uid, question_ids
+    )
+    added: list = []
+    if round_number <= remediate.MAX_ROUNDS:
+        already = await store.remediated_concepts(connection, plan_id)
+        worth = remediate.worth_acting_on(
+            [m for m in missed if m.concept_node_id not in already],
+            len(question_ids),
+        )
+        added = await store.append_remediation(
+            connection,
+            plan_id,
+            remediate.steps_for(
+                worth,
+                intent=plan["intent"],
+                # At or below what the checkpoint asked for. A student who has just
+                # missed these is not helped by harder versions of them.
+                difficulty=_remediation_difficulty(checkpoint_items),
+            ),
+            round_number,
+        )
+    await store.reopen_checkpoint(connection, checkpoint["step_id"])
+    return added
+
+
+def _remediation_difficulty(items: list) -> list[str]:
+    """Everything up to the checkpoint's own level, read off its own selector.
+
+    A student who has just missed these is not helped by harder versions of them, so the
+    ladder is capped at what the check asked for rather than opened to everything. An
+    unrated or unfiltered checkpoint gives no ceiling to respect, and the empty list is
+    the resolver's way of saying "any".
+    """
+    ladder = ["easy", "medium", "hard"]
+    levels = {
+        d
+        for item in items
+        for d in (item["sel_difficulty"] or [])
+        if d in ladder
+    }
+    if not levels:
+        return []
+    ceiling = max(levels, key=ladder.index)
+    return ladder[: ladder.index(ceiling) + 1]
 
 
 @router.post("/{plan_id}/archive", response_model=PlanSummary)
@@ -645,6 +731,7 @@ def _step(step, items, derived, request: Request) -> PlanStep:
         how_to_use=list(step["how_to_use"] or []),
         focus_node_ids=list(step["focus_node_ids"] or []),
         is_foundation=step["is_foundation"],
+        remediation_round=step["remediation_round"],
         depends_on=[str(d) for d in (step["depends_on"] or [])],
         estimated_minutes=step["estimated_minutes"],
         completion_kind=step["completion_kind"],
