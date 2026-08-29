@@ -18,5 +18,10 @@ class Settings(BaseSettings):
     jeene_planner_model: str | None = None
     jeene_planner_enabled: bool = False
 
+    # Signs the short-lived links the app uses to open files we host — today the chapter
+    # notes viewer. Optional so a laptop needs no setup: without it every process signs
+    # with its own random secret, which is correct for one worker and broken for two.
+    jeene_asset_secret: str | None = None
+
 
 settings = Settings()

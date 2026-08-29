@@ -437,7 +437,10 @@ class ChapterNotes(BaseModel):
     """
     chapter_id: str
     title: str
-    pdf_url: str
+    # Where the app sends a web view to read them. Signed and short-lived, and
+    # deliberately not `pdf_url`: the object URL in storage is durable, unauthenticated
+    # and shareable, so it does not leave the server. See `app/routers/notes.py`.
+    viewer_url: str
     # Both nullable in the table, and so both nullable here. They were declared required,
     # which meant a published row whose size had not been recorded made the endpoint 500
     # rather than answer — found the first time a client actually called it, which was

@@ -4,3 +4,6 @@ asyncpg==0.31.0
 pydantic-settings==2.14.2
 firebase-admin==7.5.0
 openai==3.6.0
+# Streams the notes PDF from storage; see app/routers/notes.py. Already present as
+# a transitive dependency of openai and firebase-admin, pinned here because we import it.
+httpx==0.28.1
