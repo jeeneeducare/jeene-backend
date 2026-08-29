@@ -24,6 +24,7 @@ from app.plans.schema import (
     PlanItem,
     PlanStep,
     QuestionBucket,
+    TestItem as PaperItem,
     QuestionSelector,
     ScopeInfo,
     StepCompletion,
@@ -49,6 +50,10 @@ def _inventory(**kw) -> Inventory:
             videos=[VideoItem(youtube_id="vid00000001", title="v",
                               hangs_on_node_id="sub_1", hangs_on_title="s")],
             notes=[NotesItem(chapter_id="ch_8", title="notes", page_count=10)],
+            # A real paper, so "papers are refused whether or not the id exists" is a
+            # claim the suite actually tests rather than one it restates.
+            tests=[PaperItem(test_id="mock_1", title="Mock 1", question_count=180,
+                            in_scope_question_count=6)],
         ),
         question_buckets=[
             QuestionBucket(node_id=c, question_type=t, difficulty=d, total=8)
@@ -134,11 +139,18 @@ def test_notes_for_a_chapter_without_any_are_rejected():
     assert any("do not exist" in e for e in _errors(plan))
 
 
-def test_a_test_that_does_not_exist_is_rejected():
-    plan = _plan(
-        _step(items=[PlanItem(type="test", test_id="mock_99")]), _step(), _checkpoint()
-    )
-    assert any("not in the catalogue" in e for e in _errors(plan))
+def test_a_paper_is_rejected_whether_or_not_it_exists():
+    """Papers are not plan material at all any more.
+
+    They are full mocks, so most of one is about something else, and no app can sit one
+    from inside a plan — the test flow is Android-only. A step pointing at a paper is a
+    step the student cannot open, and the id being real does not change that.
+    """
+    for test_id in ("mock_99", "mock_1"):
+        plan = _plan(
+            _step(items=[PlanItem(type="test", test_id=test_id)]), _step(), _checkpoint()
+        )
+        assert any("full paper" in e for e in _errors(plan)), test_id
 
 
 def test_a_concept_outside_the_scope_is_rejected():

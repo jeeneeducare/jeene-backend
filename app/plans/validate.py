@@ -266,9 +266,16 @@ def _check_items(
             verdict.errors.append(
                 f"{where} uses notes for {item.notes_chapter_id!r}, which do not exist."
             )
-        elif item.type == "test" and item.test_id not in tests:
+        elif item.type == "test":
+            # Not "unknown test" — no test at all, whether or not the id is real. The
+            # catalogue's papers are full mocks whose overlap with any one subtopic is
+            # small, and neither app can sit one from inside a plan: the test flow exists
+            # on Android only, and a step that hands a student off to a ninety-minute
+            # mock is not the practice the step promised. The planner is told this in the
+            # rules; this is the part that makes it true.
             verdict.errors.append(
-                f"{where} uses test {item.test_id!r}, which is not in the catalogue."
+                f"{where} points at a full paper. Papers cannot be opened from a plan — "
+                "use a questions selector for exam-shaped practice instead."
             )
         elif item.type == "questions":
             _check_selector(
