@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse
 from app.auth import current_tenant, require_user
 from app.db import get_connection
 from app.figures import fetch_figures
+from app.visibility import NOT_UNRELEASED_TEST_SQL
 from app.schemas import (
     QuestionExplanation,
     Chapter,
@@ -28,15 +29,9 @@ router = APIRouter()
 # in practice before sitting it.
 #
 # Keyed on the question's own source, NOT merely on membership of an unreleased test.
-# A generated paper draws on questions that already live in the bank, and putting one
-# of those into an unreleased test must not pull it out of practice — only questions
-# that ARRIVED with a paper are gated.
-_NOT_UNRELEASED_TEST = """
-  AND (q.source <> 'test_paper' OR EXISTS (
-        SELECT 1 FROM test_questions tq
-        JOIN tests t ON t.test_id = tq.test_id
-        WHERE tq.question_id = q.question_id AND t.released_at IS NOT NULL))
-"""
+# Lives in app/visibility.py so the study planner counts exactly the questions this
+# serves. Kept under the old name so every query below reads unchanged.
+_NOT_UNRELEASED_TEST = NOT_UNRELEASED_TEST_SQL
 
 
 @router.get("/chapters", response_model=list[Chapter])

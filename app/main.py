@@ -7,7 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import db
 from app.auth import init_firebase
-from app.routers import admin, attempts, auth, content, health, mistakes, reports, tests
+from app.routers import (
+    admin,
+    attempts,
+    auth,
+    content,
+    health,
+    mistakes,
+    plans,
+    reports,
+    tests,
+)
 
 
 @asynccontextmanager
@@ -44,4 +54,5 @@ app.include_router(attempts.router)
 app.include_router(tests.router)
 app.include_router(reports.router)
 app.include_router(mistakes.router)
+app.include_router(plans.router)
 app.include_router(admin.router)
