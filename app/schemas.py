@@ -505,3 +505,107 @@ class VideoGroup(BaseModel):
     # so the screen can say where the videos came from instead of implying they are here.
     inherited: bool = False
     videos: list[ChapterVideo] = []
+
+
+# ---------------------------------------------------------------------------
+# Jeene Mode. The wire format, which is deliberately not the planner's contract:
+# the app needs ids, derived state and real counts, none of which a planner emits.
+# ---------------------------------------------------------------------------
+
+
+class PlanSummary(BaseModel):
+    """One row of the plan history."""
+
+    plan_id: str
+    scope_node_id: str
+    scope_type: str
+    scope_title: str
+    subject: str | None = None
+    proficiency: str
+    intent: str
+    status: str
+    summary: str
+    step_count: int
+    done_count: int
+    # Skipped steps leave the sum rather than counting as done.
+    percent: float
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlanStepItem(BaseModel):
+    item_id: str
+    type: str
+    video_id: str | None = None
+    player_url: str | None = None
+    notes_chapter_id: str | None = None
+    test_id: str | None = None
+
+    # What the plan asked for. Shown as an estimate — "about 8 questions" — because it
+    # is one until the step is opened.
+    planned_count: int | None = None
+    # What actually exists, known only once the step has been opened and its questions
+    # frozen. Null before that, and never guessed: a step that says 10 and opens on 6 is
+    # a bug the student can see.
+    question_count: int | None = None
+    question_ids: list[str] = []
+
+
+class PlanStep(BaseModel):
+    step_id: str
+    position: int
+    kind: str
+    title: str
+    why: str
+    how_to_use: list[str] = []
+    focus_node_ids: list[str] = []
+    is_foundation: bool = False
+    depends_on: list[str] = []
+    estimated_minutes: int | None = None
+
+    completion_kind: str
+    required_questions: int | None = None
+    required_accuracy: float | None = None
+
+    # Derived on every read for a graded step, so there is no cached state to go stale.
+    state: str
+    answered: int = 0
+    correct: int = 0
+    items: list[PlanStepItem] = []
+
+
+class PlanDetail(PlanSummary):
+    steps: list[PlanStep] = []
+
+
+class PlanCreate(BaseModel):
+    scope_node_id: str
+    proficiency: Literal["basic", "intermediate", "advanced"]
+    intent: Literal["first_time", "revising", "exam_soon"]
+    # What the student scored on the optional placement check, when they took one. The
+    # planner is told; it does not change the proficiency they chose.
+    placement_correct: int | None = None
+    placement_of: int | None = None
+
+
+class StepItems(BaseModel):
+    """A step's items with their questions resolved, ready to open."""
+
+    step_id: str
+    items: list[PlanStepItem] = []
+    questions: list[Question] = []
+
+
+class CheckpointResult(BaseModel):
+    plan_id: str
+    step_id: str
+    offered: int
+    answered: int
+    correct: int
+    accuracy: float
+    required_accuracy: float | None = None
+    passed: bool
+    plan_status: str
+    # Filled by JM-10. A miss appends work on the concepts that were missed rather than
+    # failing the plan; until then this is always empty and the step simply stays open.
+    added_steps: list[PlanStep] = []

@@ -110,6 +110,32 @@ async def step_progress(
     )
 
 
+def state_from_counts(
+    *,
+    stored_state: str,
+    completion_kind: str,
+    answered: int,
+    correct: int,
+    required_questions: int | None,
+    required_accuracy: float | None,
+) -> str:
+    """The rule, in one place, for both the single-step read and the bulk one.
+
+    Drawing a history screen means deriving every step of every plan, and doing that a
+    step at a time is a query per step to render a list. So there are two callers, and
+    they must not each carry their own copy of when a step counts as done — that is how
+    a plan reads 60% on one screen and 40% on the next.
+    """
+    if stored_state == "skipped" or completion_kind == "self":
+        return stored_state
+    return _state_for(
+        answered=answered,
+        correct=correct,
+        required_questions=required_questions,
+        required_accuracy=required_accuracy,
+    )
+
+
 def _state_for(
     *,
     answered: int,

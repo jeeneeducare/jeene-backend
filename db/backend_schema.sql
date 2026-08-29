@@ -263,10 +263,23 @@ CREATE TABLE IF NOT EXISTS study_plans (
 
   status            TEXT NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'completed', 'archived')),
+  -- The one line shown on the plan card. Stored rather than recomputed: it was written
+  -- by whichever planner produced this plan, and a plan whose summary drifts from its
+  -- steps as the rules change is worse than one that reads slightly dated.
+  summary           TEXT NOT NULL DEFAULT '',
+  -- Which subject the card wears the colours of. Denormalised like scope_title: a
+  -- subtopic carries no subject of its own, so resolving it means walking to the
+  -- chapter, and the history screen should not need a tree walk per row.
+  subject           TEXT,
   completed_at      TIMESTAMPTZ,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- For anyone who applied the table before the column existed. Both paths land in the
+-- same place, which is what this file being the migration mechanism requires.
+ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS subject TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_study_plans_user
   ON study_plans (firebase_uid, status, updated_at DESC);

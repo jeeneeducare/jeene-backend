@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse
 from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
 from app.figures import fetch_figures
+from app.questions import fetch_questions_by_ids
 from app.visibility import NOT_UNRELEASED_TEST_SQL
 from app.schemas import (
     QuestionExplanation,
@@ -101,6 +102,10 @@ async def list_chapter_questions(
 # What `difficulty` accepts. `unrated` is not a value in the column — it is the name
 # the study planner uses for an ungraded question, translated to IS NULL downstream.
 _DIFFICULTIES = {"easy", "medium", "hard", "unrated"}
+
+# A plan step holds at most a couple of dozen questions, so this is generous. It is
+# here to bound the array a single request can ask Postgres to match against.
+_MAX_QUESTION_IDS = 100
 
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -453,6 +458,50 @@ async def list_concept_questions(
         # A signed-out caller has no history, so the flag is simply nothing to apply
         # rather than an error — the practice deck is open to anonymous browsing.
         exclude_seen_for=(user or {}).get("uid") if exclude_seen else None,
+    )
+
+
+@router.get("/questions", response_model=list[Question])
+async def get_questions_by_ids(
+    ids: list[str] = Query(
+        ..., description="Question ids. Only ids that appear in one of your own plans."
+    ),
+    user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[Question]:
+    """A plan step's frozen questions, in one request instead of N.
+
+    Deliberately **not** a general fetch-by-id. An endpoint that returns whatever ids it
+    is handed is a way to enumerate the bank one id at a time, and worse, a way to reach
+    the questions of an unreleased paper before sitting it. So the ids are intersected
+    with what the caller's own plans actually froze: anything else is silently absent
+    rather than refused, because telling a caller which of their guesses existed is the
+    enumeration they were after.
+
+    The unreleased-paper guard applies underneath that as well. Two locks, because the
+    first one only holds while every plan is written by us.
+    """
+    if len(ids) > _MAX_QUESTION_IDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Ask for at most {_MAX_QUESTION_IDS} questions at a time.",
+        )
+    allowed = await connection.fetchval(
+        """
+        SELECT COALESCE(array_agg(DISTINCT q), '{}')
+          FROM study_plan_step_items i
+          JOIN study_plan_steps s ON s.step_id = i.step_id
+          JOIN study_plans p ON p.plan_id = s.plan_id
+          CROSS JOIN LATERAL unnest(i.resolved_question_ids) AS q
+         WHERE p.firebase_uid = $1 AND q = ANY($2::text[])
+        """,
+        user["uid"],
+        ids,
+    )
+    permitted = set(allowed or [])
+    return await fetch_questions_by_ids(
+        connection, tenant, [q for q in ids if q in permitted]
     )
 
 
