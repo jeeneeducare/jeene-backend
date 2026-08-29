@@ -67,16 +67,20 @@ ON CONFLICT (node_id) DO NOTHING;
 UPDATE nodes SET prerequisite_node_ids = ARRAY['c_newton2'] WHERE node_id = 'c_height';
 
 -- --- questions --------------------------------------------------------------------------
--- Twelve per concept: three types x (easy, medium, hard, ungraded), so a selector has
--- something to filter and `unrated` is a real case rather than a hypothetical.
+-- Forty-eight per concept: three types x four difficulties (including ungraded) x four
+-- variants. The variants matter: with one question per bucket, any filter naming two
+-- facets matched one or two questions and every plan that used one was rejected as
+-- asking for questions that do not exist. A fixture thin enough to make correct plans
+-- look wrong is measuring the fixture.
 
 INSERT INTO questions (question_id, tenant_id, question_type, question_text, options_json,
                        correct_option_ids, explanation_json, difficulty, status, source)
 SELECT
-  concept || '_' || qtype || '_' || COALESCE(diff, 'unrated'),
+  concept || '_' || qtype || '_' || COALESCE(diff, 'unrated') || '_' || variant,
   'JEENE_MASTER',
   qtype,
-  'STEM ' || concept || ' ' || qtype || ' ' || COALESCE(diff, 'unrated'),
+  'STEM ' || concept || ' ' || qtype || ' ' || COALESCE(diff, 'unrated')
+    || ' #' || variant,
   '[{"id":"a","text":"OPTION-A"},{"id":"b","text":"OPTION-B"},
     {"id":"c","text":"OPTION-C"},{"id":"d","text":"OPTION-D"}]'::jsonb,
   ARRAY['b'],
@@ -87,6 +91,7 @@ SELECT
 FROM unnest(ARRAY['c_height','c_depth','c_latitude','c_newton2']) AS concept
 CROSS JOIN unnest(ARRAY['mcq','pyq','ncert_exemplar']) AS qtype
 CROSS JOIN unnest(ARRAY['easy','medium','hard',NULL]) AS diff
+CROSS JOIN generate_series(1, 4) AS variant
 ON CONFLICT (question_id) DO NOTHING;
 
 INSERT INTO question_concept_mappings (question_id, concept_node_id, is_primary)
@@ -97,7 +102,7 @@ ON CONFLICT DO NOTHING;
 -- One question tagged to a second concept, so "bucket totals cannot be summed" is a real
 -- condition in the data rather than only an assertion in a comment.
 INSERT INTO question_concept_mappings (question_id, concept_node_id, is_primary)
-VALUES ('c_height_mcq_easy', 'c_depth', false)
+VALUES ('c_height_mcq_easy_1', 'c_depth', false)
 ON CONFLICT DO NOTHING;
 
 -- A question that arrived with an unreleased paper. It must be invisible to browsing,
@@ -121,9 +126,9 @@ VALUES ('unreleased_mock', 'c_height_paper_q1', 1) ON CONFLICT DO NOTHING;
 
 INSERT INTO question_figures (figure_id, question_id, placement, image_url, display_order, source)
 VALUES
-  ('fig_stem_1', 'c_height_mcq_easy', 'stem',
+  ('fig_stem_1', 'c_height_mcq_easy_1', 'stem',
    'https://cdn.example/STEM-FIGURE.png', 0, 'ncert'),
-  ('fig_expl_1', 'c_height_mcq_easy', 'explanation',
+  ('fig_expl_1', 'c_height_mcq_easy_1', 'explanation',
    'https://cdn.example/SOLUTION-FIGURE.png', 0, 'ncert')
 ON CONFLICT (figure_id) DO NOTHING;
 
@@ -142,7 +147,7 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO question_explanations (question_id, tenant_id, text, model, prompt_version,
                                    source_hash, status)
-VALUES ('c_height_mcq_easy', 'JEENE_MASTER', 'AI-EXPLANATION-TEXT', 'seed', 1, 'x', 'published')
+VALUES ('c_height_mcq_easy_1', 'JEENE_MASTER', 'AI-EXPLANATION-TEXT', 'seed', 1, 'x', 'published')
 ON CONFLICT DO NOTHING;
 
 -- --- students ------------------------------------------------------------------------------
@@ -194,9 +199,9 @@ INSERT INTO attempts (attempt_id, firebase_uid, tenant_id, question_id, is_corre
                       time_spent_ms, created_at)
 VALUES
   (md5('seed:lat:wrong')::uuid, 'student-with-history', 'JEENE_MASTER',
-   'c_latitude_mcq_easy', false, 30000, now() - interval '3 days'),
+   'c_latitude_mcq_easy_1', false, 30000, now() - interval '3 days'),
   (md5('seed:lat:right')::uuid, 'student-with-history', 'JEENE_MASTER',
-   'c_latitude_mcq_easy', true, 20000, now() - interval '1 day')
+   'c_latitude_mcq_easy_1', true, 20000, now() - interval '1 day')
 ON CONFLICT (attempt_id) DO NOTHING;
 
 COMMIT;

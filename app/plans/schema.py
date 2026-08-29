@@ -193,8 +193,14 @@ class StudentRecord(BaseModel):
 
 
 class PlanConstraints(BaseModel):
-    min_steps: int = 4
-    max_steps: int = 8
+    # A floor this scope can actually meet, computed per scope rather than fixed. Told
+    # "at least four" for a scope that supports two, a planner does the only thing it
+    # can and invents work — which is exactly what the deterministic planner was
+    # deliberately stopped from doing.
+    min_steps: int = 3
+    # Matches the deterministic planner's ceiling, so a plan's length does not visibly
+    # depend on which planner produced it.
+    max_steps: int = 6
     max_foundation_steps: int = 2
     target_difficulty: TargetDifficulty = "medium"
     available_question_types: list[str] = []

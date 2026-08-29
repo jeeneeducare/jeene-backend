@@ -11,5 +11,12 @@ class Settings(BaseSettings):
     firebase_service_account_json: str | None = None
     google_application_credentials: str | None = None
 
+    # The study planner. All three are optional and their absence is not an error: with
+    # no key, or with the flag off, every plan comes from the deterministic planner and
+    # no network call is made. That is the shipping configuration.
+    openai_api_key: str | None = None
+    jeene_planner_model: str | None = None
+    jeene_planner_enabled: bool = False
+
 
 settings = Settings()

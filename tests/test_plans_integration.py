@@ -28,6 +28,13 @@ STUDENT = "student-with-history"
 FRESH = "student-fresh"
 SCRATCH = "student-scratch"    # the only student these tests write attempts for
 
+# The seed's shape, named rather than repeated as literals. Three concepts under the
+# subtopic, each with three question types x four difficulties x four variants.
+CONCEPTS_IN_SCOPE = 3
+PER_CONCEPT = 3 * 4 * 4
+SCOPE_TOTAL = CONCEPTS_IN_SCOPE * PER_CONCEPT
+PER_DIFFICULTY = 3 * 4
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -141,11 +148,11 @@ def test_bucket_totals_really_do_over_count_a_multi_tagged_question(client):
 @integration
 def test_a_question_from_an_unreleased_paper_is_in_no_count_and_no_deck(client):
     payload = client.get("/plans/debug/inventory", params={"node_id": SCOPE}).json()
-    # 3 concepts x 3 types x 4 difficulties = 36, plus the multi-tag, minus the paper one.
-    assert payload["scope_question_total"] == 36
+    # The seeded questions, and not the one belonging to the unreleased paper.
+    assert payload["scope_question_total"] == SCOPE_TOTAL
 
     questions = client.get(
-        f"/concepts/c_height/questions", params={"limit": 100}
+        "/concepts/c_height/questions", params={"limit": 100}
     ).json()
     ids = [q["question_id"] for q in questions["items"]]
     assert "c_height_paper_q1" not in ids
@@ -460,18 +467,20 @@ def test_the_history_percentage_matches_the_plan_screen(client):
 @integration
 def test_the_concept_question_filters_narrow_without_breaking_the_total(client):
     unfiltered = client.get("/concepts/c_height/questions", params={"limit": 100}).json()
-    assert unfiltered["total"] == len(unfiltered["items"]) == 12
+    assert unfiltered["total"] == len(unfiltered["items"]) == PER_CONCEPT
 
     easy = client.get(
         "/concepts/c_height/questions", params={"difficulty": "easy", "limit": 100}
     ).json()
-    assert easy["total"] == len(easy["items"]) == 3
+    assert easy["total"] == len(easy["items"]) == PER_DIFFICULTY
     assert all(q["difficulty"] == "easy" for q in easy["items"])
 
+    # `unrated` is not a value in the column, and once collapsed to "no filter" it
+    # matched every question in the concept rather than the ungraded ones.
     unrated = client.get(
         "/concepts/c_height/questions", params={"difficulty": "unrated", "limit": 100}
     ).json()
-    assert unrated["total"] == 3
+    assert unrated["total"] == PER_DIFFICULTY
     assert all(q["difficulty"] is None for q in unrated["items"])
 
 

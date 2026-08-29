@@ -15,7 +15,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.plans import store
-from app.plans.progress import plan_percent, state_from_counts
+from app.plans.progress import plan_percent
 from app.routers import plans as plans_router
 from app.schemas import PlanCreate, PlanDetail, PlanStep, PlanStepItem, PlanSummary
 

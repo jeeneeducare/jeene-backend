@@ -12,13 +12,18 @@ is a different job from reading what it produced.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import asyncpg
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.auth import current_tenant, require_admin, require_user
+from app.config import settings
 from app.db import get_connection
-from app.plans import fallback, store
+from app.plans import store
+from app.plans.generate import generate
+from app.plans.prompt import PROMPT_VERSION
 from app.plans.inventory import build_inventory
 from app.plans.progress import (
     plan_is_complete,
@@ -36,6 +41,7 @@ from app.plans.schema import (
 )
 from app.plans.scope import SCOPE_TYPES, resolve_scope
 from app.plans.resolve import resolve_selector
+from app.providers.openai_provider import build_provider
 from app.questions import fetch_questions_by_ids
 from app.schemas import (
     CheckpointResult,
@@ -49,11 +55,6 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/plans", tags=["plans"])
-
-# Bumped when the rubric changes, so a cohort produced by an old one can be found and
-# regenerated rather than left mixed in with the new. The deterministic planner has a
-# version too: its rules are as much "the prompt" as any prompt will be.
-PROMPT_VERSION = 1
 
 # How many questions the optional placement check asks. Five is short enough that a
 # student will actually take it and long enough to tell "never seen this" from "fine".
@@ -489,13 +490,24 @@ async def debug_inventory(
 
 
 async def _generate(inventory: Inventory):
-    """Produce a plan. Today there is one way; JM-5 adds the other above it.
+    """Produce a plan. The provider goes above the deterministic planner, never instead.
 
-    Kept as a seam rather than inlined so that adding a provider is a change to this
-    function and to nothing else — and so that the fallback stays the thing that runs
-    when the provider is absent, rather than becoming an error path nobody exercises.
+    The seam JM-4 left. Everything about choosing, calling, validating and repairing lives
+    in `plans/generate.py`; this reads the configuration and hands it over.
     """
-    return fallback.plan(inventory), "fallback", None, None
+    result = await generate(
+        inventory,
+        _planner_provider(),
+        enabled=settings.jeene_planner_enabled,
+    )
+    return result.plan, result.origin, result.provider, result.model
+
+
+@lru_cache(maxsize=1)
+def _planner_provider():
+    """Built once. The client holds a connection pool and rebuilding it per request
+    would spend more time on TLS than on the plan."""
+    return build_provider(settings.openai_api_key, settings.jeene_planner_model)
 
 
 async def _check_limits(connection: asyncpg.Connection, firebase_uid: str) -> None:

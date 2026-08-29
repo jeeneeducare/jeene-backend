@@ -76,6 +76,9 @@ FORBIDDEN_COLUMNS = (
 # you rather than by argument.
 _MAX_BUCKETS = 200
 
+# Below this, a scope has not got enough to fill three steps honestly.
+_THIN_SCOPE_QUESTIONS = 15
+
 # Proficiency is the plan's centre of gravity, not a filter. A basic plan still has to
 # reach the target by its checkpoint; this is where it aims, not where it stops.
 _TARGET_DIFFICULTY = {
@@ -262,10 +265,25 @@ async def build_inventory(
         rollup=rollup,
         student=student,
         constraints=PlanConstraints(
+            min_steps=_min_steps(materials, total_questions),
             target_difficulty=_TARGET_DIFFICULTY.get(proficiency or "", "medium"),
             available_question_types=sorted({b.question_type for b in buckets}),
         ),
     )
+
+
+def _min_steps(materials: Materials, total_questions: int) -> int:
+    """How many steps this scope can support without padding.
+
+    A scope with something to read or watch has a natural first step and a natural
+    check after it; one with a dozen questions and no lecture honestly supports
+    practise-then-checkpoint and nothing more. Sending a floor the scope cannot meet
+    makes a planner invent work, and a student can tell.
+    """
+    has_material = bool(materials.videos or materials.notes)
+    if has_material or total_questions >= _THIN_SCOPE_QUESTIONS:
+        return 3
+    return 2
 
 
 def _scope_info(scope: ResolvedScope) -> ScopeInfo:
