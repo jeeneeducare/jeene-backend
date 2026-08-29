@@ -140,7 +140,12 @@ def test_three_active_plans_is_the_cap_that_was_designed_for():
 
 @pytest.mark.parametrize(
     "hour,day,status",
-    [(0, 0, None), (3, 3, 429), (0, 10, 429), (2, 9, None)],
+    [
+        (0, 0, None),
+        (store.MAX_PLANS_PER_HOUR, store.MAX_PLANS_PER_HOUR, 429),
+        (0, store.MAX_PLANS_PER_DAY, 429),
+        (store.MAX_PLANS_PER_HOUR - 1, store.MAX_PLANS_PER_DAY - 1, None),
+    ],
 )
 def test_the_spending_limits_are_counted_per_account(hour, day, status):
     connection = _FakeConnection(rows=[], row={"hour": hour, "day": day})
@@ -417,3 +422,13 @@ def test_losing_the_create_race_resumes_rather_than_five_hundreds():
     source = inspect.getsource(plans_router.create_plan)
     assert "UniqueViolationError" in source
     assert "active_plan_for_scope" in source.split("except UniqueViolationError")[1]
+
+
+def test_the_hourly_limit_leaves_room_to_replace_a_plan():
+    """Two limits that individually look fine and together make the feature unusable.
+
+    Set equal to the active cap, a student who filled their three slots and archived one
+    could not start the replacement for an hour. Only running the sequence showed it.
+    """
+    assert store.MAX_PLANS_PER_HOUR > store.MAX_ACTIVE_PLANS
+    assert store.MAX_PLANS_PER_DAY >= store.MAX_PLANS_PER_HOUR

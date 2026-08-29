@@ -136,11 +136,47 @@ def test_no_question_ids_means_no_query_at_all():
 
 
 # --- integration tests: hit the real endpoints against Supabase ---
-# Require DATABASE_URL and the published phy_11_ch4 seed; skipped otherwise.
+# Require DATABASE_URL *and* the published phy_11_ch4 seed; skipped otherwise.
+#
+# The seed check is the second half, and it was added when running against a local
+# database became possible at all. These tests assert on the real content — "Laws of
+# Motion", 163 questions, particular question ids — so pointing DATABASE_URL at any other
+# database made seven of them fail for reasons that had nothing to do with the change
+# being tested. Checking for the seed rather than for an environment variable means
+# nobody has to remember to set anything: against Supabase they run, elsewhere they skip
+# and say why.
+
+
+def _has_phy_11_ch4_seed() -> bool:
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        return False
+    try:
+        import asyncio
+
+        import asyncpg
+
+        async def check():
+            conn = await asyncpg.connect(dsn)
+            try:
+                return await conn.fetchval(
+                    "SELECT 1 FROM nodes WHERE node_id = 'phy_11_ch4' "
+                    "AND status = 'published'"
+                )
+            finally:
+                await conn.close()
+
+        return bool(asyncio.run(check()))
+    except Exception:
+        return False
+
 
 integration = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
-    reason="DATABASE_URL not set; integration tests need Supabase",
+    not _has_phy_11_ch4_seed(),
+    reason=(
+        "needs DATABASE_URL pointing at a database with the published phy_11_ch4 seed; "
+        "see db/testdata/seed_plans.sql for the local alternative"
+    ),
 )
 
 

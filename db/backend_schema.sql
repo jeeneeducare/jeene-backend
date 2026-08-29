@@ -166,6 +166,34 @@ CREATE TABLE IF NOT EXISTS question_explanations (
 CREATE INDEX IF NOT EXISTS idx_question_explanations_status
     ON question_explanations (status);
 
+-- Written notes for a chapter, as a hosted PDF.
+--
+-- Reconstructed from the queries in `content.py`, which has read this table since notes
+-- shipped. It existed in the live database and in no schema file, which meant a database
+-- built from version control could not serve `/chapters/{id}/notes` at all — and, later,
+-- could not build a study-plan inventory. Found by standing up a fresh database from
+-- this repo and watching the query fail.
+--
+-- The live table is the authority on anything this gets wrong: `IF NOT EXISTS` means
+-- production is untouched, so if the two have drifted this is the copy to correct.
+CREATE TABLE IF NOT EXISTS chapter_notes (
+    chapter_id  text PRIMARY KEY REFERENCES nodes(node_id),
+    tenant_id   text NOT NULL,
+    title       text NOT NULL,
+    -- What the reader opens. Never described to a planning model, and from JM-9 served
+    -- through our own viewer rather than handed to the client.
+    pdf_url     text NOT NULL,
+    page_count  integer,
+    size_bytes  bigint,
+    status      text NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'published')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chapter_notes_status ON chapter_notes (tenant_id, status);
+
+
 -- Videos, at any level of the tree.
 --
 -- Supersedes chapter_videos. A link that explains one topic belongs on that topic, and

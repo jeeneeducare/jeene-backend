@@ -22,6 +22,27 @@ async def _init_connection(connection: asyncpg.Connection) -> None:
     )
 
 
+def _ssl_mode(dsn: str):
+    """TLS is required unless the connection string explicitly says otherwise.
+
+    Supabase requires it and the default must stay `require`, so that forgetting to
+    configure anything cannot quietly downgrade a production connection.
+
+    But it was hardcoded, which meant the app could not connect to a database without
+    TLS — including every local Postgres — and so nothing in this repo could be run
+    against a real database at all. That is not a small thing: it is why the integration
+    tests only ever ran against Supabase, and why four tickets of Jeene Mode were written
+    without a single query being executed.
+
+    So a DSN that carries its own `sslmode` is believed. Saying `?sslmode=disable` is a
+    deliberate act, it is visible in the connection string, and nobody types it into a
+    Render environment variable by accident.
+    """
+    if dsn and "sslmode=" in dsn:
+        return None  # asyncpg reads sslmode from the DSN when ssl is not given
+    return "require"
+
+
 async def connect_pool() -> None:
     global _pool
     if not settings.database_url:
@@ -36,7 +57,7 @@ async def connect_pool() -> None:
         try:
             _pool = await asyncpg.create_pool(
                 dsn=settings.database_url,
-                ssl="require",
+                ssl=_ssl_mode(settings.database_url),
                 statement_cache_size=0,
                 min_size=1,
                 max_size=5,

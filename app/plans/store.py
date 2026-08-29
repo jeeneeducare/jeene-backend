@@ -29,7 +29,10 @@ MAX_ACTIVE_PLANS = 3
 # What a student may spend. Generating is the only paid path — resuming, opening and
 # completing are free and unlimited — so this is the only place a limit belongs.
 MAX_PLANS_PER_DAY = 10
-MAX_PLANS_PER_HOUR = 3
+# Must stay above MAX_ACTIVE_PLANS. Set equal to it, a student who filled their three
+# slots and archived one could not start the replacement for an hour — the two limits
+# made each other unusable, and only running the sequence showed it.
+MAX_PLANS_PER_HOUR = 5
 
 # Columns the plan list and the plan detail both need. Named rather than starred so a
 # column added later has to be asked for.

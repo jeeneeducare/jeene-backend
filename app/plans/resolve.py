@@ -68,6 +68,26 @@ _DIFFICULTY_RANK = """
 """
 
 
+def difficulty_filter(difficulty: list[str]) -> tuple[list[str] | None, bool]:
+    """`(graded difficulties, whether ungraded questions are wanted)`.
+
+    The distinction that matters is between NULL and an empty array. NULL means "do not
+    filter on difficulty at all"; an empty array means "match no graded difficulty",
+    which is what an `unrated`-only request needs.
+
+    Collapsing the empty list to NULL — which is what `[...] or None` does — turned
+    "only ungraded questions" into "every question", because the clause short-circuits on
+    `IS NULL`. A checkpoint asking for ungraded questions would have quietly drawn from
+    the whole bank. Two modules had the same line; both are now this function.
+    """
+    if not difficulty:
+        return None, False
+    return [d for d in difficulty if d != _UNRATED], _UNRATED in difficulty
+
+
+_difficulty_filter = difficulty_filter
+
+
 def _resolution_query(
     selector: QuestionSelector,
     tenant: str,
@@ -88,13 +108,14 @@ def _resolution_query(
     three orderings — the kind a fake connection will never catch.
     """
     order = _ORDERINGS[selector.order]
+    graded, allow_unrated = _difficulty_filter(selector.difficulty)
     args = [
         tenant,
         selector.concept_node_ids,
         firebase_uid,
         selector.question_types or None,
-        [d for d in selector.difficulty if d != _UNRATED] or None,
-        _UNRATED in selector.difficulty,
+        graded,
+        allow_unrated,
         selector.count,
     ]
     if _SALT_PLACEHOLDER in order:

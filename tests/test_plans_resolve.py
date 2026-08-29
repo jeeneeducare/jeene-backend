@@ -103,13 +103,41 @@ def test_unrated_is_translated_to_a_null_check_not_compared_as_a_string():
 
 
 def test_an_unrated_only_selector_asks_only_for_ungraded_questions():
+    """An empty array and NULL are different questions, and this once conflated them.
+
+    `[d for d in difficulty if d != "unrated"] or None` turned "match no graded
+    difficulty" into "do not filter on difficulty", so an unrated-only selector drew from
+    the whole bank. The unit test asserted `None` and called it correct; a real database
+    found it in one query. Empty array here, and it must stay empty.
+    """
     connection = _FakeConnection()
     asyncio.run(
         resolve_selector(connection, "JEENE_MASTER", "uid", _selector(difficulty=["unrated"]))
     )
     args = connection.calls[0][1]
-    assert args[4] is None
+    assert args[4] == [], "not None — NULL would disable the filter entirely"
     assert args[5] is True
+
+
+def test_no_difficulty_at_all_is_the_only_thing_that_disables_the_filter():
+    connection = _FakeConnection()
+    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector()))
+    assert connection.calls[0][1][4] is None
+
+
+@pytest.mark.parametrize(
+    "difficulty,graded,unrated",
+    [
+        ([], None, False),
+        (["easy"], ["easy"], False),
+        (["unrated"], [], True),
+        (["easy", "unrated"], ["easy"], True),
+    ],
+)
+def test_the_difficulty_filter_distinguishes_none_from_empty(difficulty, graded, unrated):
+    from app.plans.resolve import difficulty_filter
+
+    assert difficulty_filter(difficulty) == (graded, unrated)
 
 
 def test_empty_filters_mean_any_rather_than_none():

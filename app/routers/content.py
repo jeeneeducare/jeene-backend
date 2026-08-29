@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse
 from app.auth import current_tenant, optional_user, require_user
 from app.db import get_connection
 from app.figures import fetch_figures
+from app.plans.resolve import difficulty_filter
 from app.questions import fetch_questions_by_ids
 from app.visibility import NOT_UNRELEASED_TEST_SQL
 from app.schemas import (
@@ -669,8 +670,7 @@ async def _paginated_questions_for_node_ids(
     the planner uses for a question the pipeline has not graded — so it is translated to
     an IS NULL here rather than compared as a string.
     """
-    graded = [d for d in (difficulty or []) if d != "unrated"] or None
-    allow_unrated = "unrated" in (difficulty or [])
+    graded, allow_unrated = difficulty_filter(difficulty or [])
     # Written once and shared by the count and the page, because a total that disagrees
     # with the rows underneath it is worse than no total.
     filters = """
