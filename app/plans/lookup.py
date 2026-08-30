@@ -155,10 +155,10 @@ WITH RECURSIVE candidates AS (
      LIMIT $8
 ),
 descendants AS (
-    SELECT c.node_id AS root_id, c.node_id
+    SELECT c.node_id AS root_id, c.node_id, c.type
       FROM candidates c
     UNION ALL
-    SELECT d.root_id, n.node_id
+    SELECT d.root_id, n.node_id, n.type
       FROM nodes n
       JOIN descendants d ON n.parent_id = d.node_id
      WHERE n.tenant_id = $1 AND n.status = 'published'
@@ -168,7 +168,14 @@ counts AS (
       FROM descendants d
       JOIN question_concept_mappings m ON m.concept_node_id = d.node_id
       JOIN questions q ON q.question_id = m.question_id
-     WHERE q.tenant_id = $1
+     -- Concepts only, because that is what the planner counts: `resolve_scope` takes
+     -- `[n for n in subtree if n.type == 'concept']` and the inventory's buckets are
+     -- built from exactly those. `question_concept_mappings.concept_node_id` is only
+     -- `REFERENCES nodes(node_id)` — nothing in the schema stops a mapping pointing at
+     -- a subtopic — so counting every descendant type would let this promise a scope
+     -- whose buckets come back empty, which is the 409 this filter exists to prevent.
+     WHERE d.type = 'concept'
+       AND q.tenant_id = $1
        AND q.status = 'published'
        {NOT_UNRELEASED_TEST_SQL}
      GROUP BY d.root_id

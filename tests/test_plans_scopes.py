@@ -203,6 +203,14 @@ def test_a_scope_with_nothing_to_practise_is_dropped():
     assert "LEFT JOIN counts" not in lookup._CANDIDATES_SQL
 
 
+def test_only_concept_mapped_questions_count_toward_plannability():
+    # The planner counts questions mapped to the scope's *concepts* — resolve_scope takes
+    # the concept-typed subtree and the inventory's buckets come from those alone. The
+    # mapping column is only REFERENCES nodes(node_id), so a row pointing at a subtopic
+    # is schema-legal; counting it here would promise a scope whose buckets are empty.
+    assert "WHERE d.type = 'concept'" in lookup._CANDIDATES_SQL
+
+
 def test_an_unreleased_test_paper_does_not_make_a_scope_look_plannable():
     assert "test_questions" in lookup._CANDIDATES_SQL
     assert "released_at IS NOT NULL" in lookup._CANDIDATES_SQL
