@@ -32,6 +32,13 @@ _MAX_RETRIES = 0
 # validation and costs a whole extra round trip to discover.
 _MAX_OUTPUT_TOKENS = 8000
 
+# Reading a message returns an id, two enums and at most a sentence. The ceiling is here
+# to bound a runaway, not to fit the answer.
+_MAX_READ_TOKENS = 600
+
+# See read_json: cheap call, expensive failure.
+_READ_RETRIES = 1
+
 
 class OpenAIPlannerProvider:
     name = "openai"
@@ -80,6 +87,64 @@ class OpenAIPlannerProvider:
         parsed = choice.message.parsed
         if parsed is None:
             raise ProviderError(f"no parseable plan (finish_reason={choice.finish_reason})")
+
+        usage = completion.usage
+        cached = 0
+        if usage is not None and usage.prompt_tokens_details is not None:
+            cached = usage.prompt_tokens_details.cached_tokens or 0
+        return parsed, ProviderUsage(
+            provider=self.name,
+            model=completion.model,
+            input_tokens=usage.prompt_tokens if usage else 0,
+            output_tokens=usage.completion_tokens if usage else 0,
+            cached_input_tokens=cached,
+            latency_ms=elapsed,
+        )
+
+
+    async def read_json(
+        self,
+        system_prompt: str,
+        context: str,
+        user_text: str,
+        schema: type[BaseModel],
+    ) -> tuple[BaseModel, ProviderUsage]:
+        # Static prompt, then the catalogue, then the student. The first two are
+        # identical on every call and are what the provider's prefix cache can hold;
+        # the student's words go last so they cannot displace it — and so they arrive
+        # plainly labelled as the thing being read rather than as instructions.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Catalogue:\n{context}"},
+            {"role": "user", "content": user_text},
+        ]
+
+        started = time.monotonic()
+        try:
+            # One retry here, unlike planning. Planning makes a student wait fifteen
+            # seconds and a retry doubles that for an answer that is rarely better;
+            # reading a message takes about a second, and a dropped connection — which
+            # is what a flaky network mostly produces — costs the student the whole
+            # feature. Measured locally: two transient APIConnectionErrors in eight
+            # calls, each of which silently became "I couldn't tell what you meant".
+            completion = await self._client.with_options(
+                max_retries=_READ_RETRIES
+            ).chat.completions.parse(
+                model=self.model,
+                messages=messages,
+                response_format=schema,
+                max_completion_tokens=_MAX_READ_TOKENS,
+            )
+        except OpenAIError as exc:
+            raise ProviderError(f"{type(exc).__name__} from {self.name}") from None
+        elapsed = int((time.monotonic() - started) * 1000)
+
+        choice = completion.choices[0]
+        if choice.message.refusal:
+            raise ProviderError("the model declined to answer")
+        parsed = choice.message.parsed
+        if parsed is None:
+            raise ProviderError(f"no parseable read (finish_reason={choice.finish_reason})")
 
         usage = completion.usage
         cached = 0

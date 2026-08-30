@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class HealthResponse(BaseModel):
@@ -609,6 +609,36 @@ class ScopeMatch(BaseModel):
     class_level: int | None = None
     question_count: int = 0
     exact: bool = False
+
+
+class PlanMessage(BaseModel):
+    """What the student typed. Length-bounded here as well as when normalised: an
+    unbounded body is an unbounded prompt, and the prompt is the thing that costs."""
+
+    text: str = Field(default="", max_length=500)
+
+
+class PlanRead(BaseModel):
+    """What the student's message turned out to mean.
+
+    `kind` is what the app branches on:
+      `scope`     — one scope, start the intake on it
+      `choose`    — several could fit; `options` are them, the student picks
+      `greeting`  — answered from a constant, no model was called
+      `too_broad` — a whole subject; `options` narrow it
+      `off_topic` — not the syllabus
+      `unclear`   — the syllabus, probably, but not identifiably
+
+    `proficiency` and `intent` are set only when the student's own words said so, and are
+    what lets the intake stop asking a question it already has the answer to.
+    """
+
+    kind: Literal["scope", "choose", "greeting", "too_broad", "off_topic", "unclear"]
+    reply: str = ""
+    scope: ScopeMatch | None = None
+    options: list[ScopeMatch] = []
+    proficiency: Literal["basic", "intermediate", "advanced"] | None = None
+    intent: Literal["first_time", "revising", "exam_soon"] | None = None
 
 
 class PlanCreate(BaseModel):

@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.auth import DEFAULT_TENANT, current_tenant, require_admin, require_user
 from app.config import settings
 from app.db import get_connection, get_pool
-from app.plans import lookup, remediate, store
+from app.plans import converse, lookup, remediate, store
 from app.plans.generate import generate
 from app.plans.prompt import PROMPT_VERSION
 from app.plans.inventory import build_inventory
@@ -50,6 +50,8 @@ from app.schemas import (
     PlanDetail,
     PlanStep,
     PlanStepItem,
+    PlanMessage,
+    PlanRead,
     PlanSummary,
     ScopeMatch,
     StepItems,
@@ -148,6 +150,95 @@ async def search_scopes(
         connection, tenant, q, limit=limit, class_level=class_level, exam=exam
     )
     return [ScopeMatch(**row) for row in rows]
+
+
+@router.post("/interpret", response_model=PlanRead)
+async def interpret_message(
+    body: PlanMessage,
+    user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> PlanRead:
+    """Work out what a student's typed message meant.
+
+    Three gates, cheapest first, because most messages should never reach a model:
+
+    1. **A greeting is answered from a constant.** No call, no latency, no cost. Students
+       say hello; that must not be a paid request.
+    2. **An unambiguous title still short-circuits.** `GET /plans/scopes` already knows
+       what "Gravitation" is, and paying a model to confirm SQL would be slower and
+       dearer for the commonest message there is.
+    3. **Everything else is read by the model**, given the syllabus outline — ids and
+       titles for scopes that have something to practise, and nothing else. It chooses
+       from that outline; it cannot widen it, and an id it did not see is discarded.
+
+    The model is also what makes "revising, exam is next week" worth typing: proficiency
+    and intent come back set, and the intake stops asking what it has already been told.
+
+    Degrades rather than fails. No provider configured, or a provider that errored, and
+    this falls through to the title search — so a student who typed a chapter name gets
+    their plan whether or not the model is reachable.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        return PlanRead(kind="unclear", reply=converse.FALLBACK_REPLIES["unclear"])
+
+    if (canned := converse.greeting_reply(text)) is not None:
+        return PlanRead(kind="greeting", reply=canned)
+
+    # The deterministic answer first: it is also the fallback, so it is computed either
+    # way, and when it is unambiguous there is nothing a model could add.
+    matches = await lookup.search_scopes(connection, tenant, text, limit=5)
+    exact = [m for m in matches if m["exact"]]
+    if len(exact) == 1:
+        return PlanRead(kind="scope", scope=ScopeMatch(**exact[0]))
+
+    # The kill switch covers every paid call, not just the plan. Turning the planner off
+    # to stop spending and still paying to read every message would be a switch that
+    # does not do what its name says.
+    provider = _planner_provider() if settings.jeene_planner_enabled else None
+    outline = await converse.load_outline(connection, tenant)
+    read = await converse.read_message(provider, text, outline)
+
+    if read is None:
+        # No model. Everything the title search found, for the student to choose from.
+        if matches:
+            return PlanRead(kind="choose", options=[ScopeMatch(**m) for m in matches])
+        return PlanRead(kind="unclear", reply=converse.FALLBACK_REPLIES["unclear"])
+
+    by_id = {row["node_id"]: row for row in outline}
+
+    def as_match(node_id: str) -> ScopeMatch:
+        row = by_id[node_id]
+        return ScopeMatch(
+            node_id=row["node_id"],
+            title=row["title"],
+            type=row["type"],
+            chapter_node_id=row["chapter_node_id"],
+            chapter_title=row["chapter_title"],
+            subject_id=row["subject_id"],
+            subject_name=row["subject_name"],
+            class_level=row["class_level"],
+            question_count=row["question_count"],
+            exact=False,
+        )
+
+    options = [as_match(node_id) for node_id in read.alternatives]
+    if read.kind == "scope":
+        return PlanRead(
+            kind="scope",
+            scope=as_match(read.node_id),
+            proficiency=read.proficiency,
+            intent=read.intent,
+        )
+    if read.kind == "choose":
+        return PlanRead(
+            kind="choose",
+            options=[as_match(read.node_id), *options],
+            proficiency=read.proficiency,
+            intent=read.intent,
+        )
+    return PlanRead(kind=read.kind, reply=read.reply, options=options)
 
 
 @router.get("/{plan_id}", response_model=PlanDetail)

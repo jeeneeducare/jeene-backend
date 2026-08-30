@@ -783,3 +783,86 @@ def test_a_found_scope_can_be_planned_without_a_409(client):
         assert response.status_code == 201, response.text
     finally:
         _as(client, STUDENT)
+
+
+# --- reading a message against a real syllabus -------------------------------------------
+
+
+@integration
+def test_the_outline_is_every_plannable_scope_and_nothing_else(client):
+    import asyncio
+    import asyncpg
+    from app.plans import converse
+
+    async def load():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            return await converse.load_outline(conn, "JEENE_MASTER")
+        finally:
+            await conn.close()
+
+    outline = asyncio.run(load())
+    ids = {r["node_id"] for r in outline}
+
+    # The seed's two chapters and their topics/subtopics, all of which have questions.
+    assert CHAPTER in ids
+    assert SCOPE in ids
+    assert {r["type"] for r in outline} <= {"chapter", "topic", "subtopic"}
+    # Concepts and subjects are not scopes and must never be offered as one.
+    assert "c_height" not in ids
+    assert "phy" not in ids
+    # Everything offered carries what an intake needs.
+    for row in outline:
+        assert row["question_count"] > 0
+        assert row["chapter_node_id"]
+
+    # And it renders to something a model can read without parsing.
+    text = converse.outline_text(outline)
+    assert f"{CHAPTER} | chapter | Gravitation" in text
+    assert "Physics" in text
+
+
+@integration
+def test_a_greeting_never_reaches_the_model(client):
+    response = client.post("/plans/interpret", json={"text": "hello"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["kind"] == "greeting"
+    assert body["scope"] is None
+    assert "study" in body["reply"].lower()
+
+
+@integration
+def test_an_exact_title_is_read_without_the_model(client):
+    # The commonest message there is. It must stay free and instant.
+    response = client.post("/plans/interpret", json={"text": "Gravitation"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["kind"] == "scope"
+    assert body["scope"]["node_id"] == CHAPTER
+
+
+@integration
+def test_with_no_model_configured_it_still_offers_what_it_found(client):
+    # The default suite runs with the planner disabled, so this is the fallback path:
+    # ambiguous words, no model, and the title search's own matches offered instead.
+    response = client.post("/plans/interpret", json={"text": "gravity"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["kind"] in {"choose", "unclear"}
+    if body["kind"] == "choose":
+        assert body["options"], "a choice with nothing to choose from is not a choice"
+
+
+@integration
+def test_an_empty_message_is_answered_rather_than_refused(client):
+    response = client.post("/plans/interpret", json={"text": "   "})
+    assert response.status_code == 200
+    assert response.json()["kind"] == "unclear"
+
+
+@integration
+def test_a_very_long_message_is_refused_by_the_contract(client):
+    # An unbounded body is an unbounded prompt, and the prompt is what costs.
+    response = client.post("/plans/interpret", json={"text": "x" * 5000})
+    assert response.status_code == 422

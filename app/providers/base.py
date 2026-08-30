@@ -56,3 +56,23 @@ class PlannerProvider(Protocol):
         retry: an identical request would most likely produce an identical answer.
         """
         ...
+
+    async def read_json(
+        self,
+        system_prompt: str,
+        context: str,
+        user_text: str,
+        schema: type[BaseModel],
+    ) -> tuple[BaseModel, ProviderUsage]:
+        """Answer a question about `user_text`, in the shape of `schema`.
+
+        Separate from `generate_plan` rather than a parameter on it, because the two
+        differ in the thing that matters: a plan gets a repair round when it fails
+        validation, and this does not. A misread message is answered by asking the
+        student again, which is faster and free.
+
+        `context` is the caller's catalogue and `user_text` is the student's own words.
+        They stay separate messages so the provider can cache the first and so the
+        second is never mistaken for instructions.
+        """
+        ...

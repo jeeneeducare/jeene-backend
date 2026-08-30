@@ -103,6 +103,12 @@ class _FakeProvider:
         self.answers = list(answers)
         self.calls = []
 
+    async def read_json(self, system_prompt, context, user_text, schema):
+        # The port covers both jobs the real provider does; this fake exists for the
+        # planning half. Raising rather than returning a stub answer, so a generation
+        # test that somehow reaches the reading path says so instead of passing quietly.
+        raise AssertionError("the planning fake was asked to read a message")
+
     async def generate_plan(self, system_prompt, inventory_json, schema,
                             repair_errors=None):
         self.calls.append({
