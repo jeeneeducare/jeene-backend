@@ -38,7 +38,12 @@ MAX_PLANS_PER_HOUR = 5
 #: Comfortably past the worst case for generation (two attempts at forty-five seconds),
 #: and short enough that a crash costs a student one slot for a couple of minutes rather
 #: than until somebody notices.
-IN_FLIGHT_WINDOW = "5 minutes"
+#:
+#: A number, not an interval string, because it is bound as a parameter rather than
+#: written into the SQL. It was `"5 minutes"` interpolated into `interval '{...}'` — safe
+#: only for as long as nobody made it configurable, which is not a property worth relying
+#: on when the alternative is one bound argument.
+IN_FLIGHT_MINUTES = 5
 
 # Columns the plan list and the plan detail both need. Named rather than starred so a
 # column added later has to be asked for.
@@ -194,14 +199,15 @@ async def reserve_generation(
         #
         # Bounded by age, because a process that died mid-generation must not hold a slot
         # for ever. Generation is allowed ninety seconds at the outside; anything older
-        # than IN_FLIGHT_WINDOW is not coming back.
+        # than IN_FLIGHT_MINUTES is not coming back.
         in_flight = await connection.fetchval(
-            f"""
+            """
             SELECT count(*) FROM plan_generations
              WHERE firebase_uid = $1 AND outcome = 'started'
-               AND created_at > now() - interval '{IN_FLIGHT_WINDOW}'
+               AND created_at > now() - make_interval(mins => $2)
             """,
             firebase_uid,
+            IN_FLIGHT_MINUTES,
         )
         if len(active) + in_flight >= MAX_ACTIVE_PLANS:
             if not active:

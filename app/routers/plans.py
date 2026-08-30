@@ -276,15 +276,6 @@ async def create_plan(
         if scope is None:
             raise HTTPException(status_code=404, detail=_no_scope(body.scope_node_id))
 
-        try:
-            generation_id = await store.reserve_generation(
-                connection, user["uid"], tenant, body.scope_node_id
-            )
-        except store.LimitReached as limit:
-            raise HTTPException(
-                status_code=limit.status, detail=limit.detail
-            ) from limit
-
         inventory = await build_inventory(
             connection,
             scope,
@@ -294,6 +285,24 @@ async def create_plan(
             intent=body.intent,
             placement=_placement(body),
         )
+        # Refused before anything is reserved or generated, because this scope cannot
+        # produce a plan at all: the checkpoint is mandatory and there is nothing for it
+        # to draw from. Ordered after the inventory and before the reservation on
+        # purpose — it used to sit after generation, so five taps on a chapter with no
+        # published questions cost five model calls, five of the student's five hourly
+        # slots, and five refusals. Building the inventory is a read; it is the cheap
+        # half of this route and belongs on the free side of the line.
+        if not inventory.question_buckets:
+            raise HTTPException(status_code=409, detail=_nothing_to_plan(scope))
+
+        try:
+            generation_id = await store.reserve_generation(
+                connection, user["uid"], tenant, body.scope_node_id
+            )
+        except store.LimitReached as limit:
+            raise HTTPException(
+                status_code=limit.status, detail=limit.detail
+            ) from limit
 
     # Phase two: the wait. No connection is held here, on purpose.
     try:
@@ -308,16 +317,13 @@ async def create_plan(
     # Phase three: write it down.
     async with pool.acquire() as connection:
         if not plan.steps:
-            # Nothing published under this scope. A plan row with no steps is worse than
-            # an error: it sits in the history looking like work the student failed to do.
+            # A backstop now rather than the main guard: an empty scope is refused before
+            # the reservation. Kept because a planner can still come back with nothing
+            # for reasons the inventory did not predict, and a plan row with no steps is
+            # worse than an error — it sits in the history looking like work the student
+            # failed to do.
             await store.finish_generation(connection, generation_id, "failed")
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"There is nothing published under '{scope.node['title']}' to build "
-                    "a plan from yet."
-                ),
-            )
+            raise HTTPException(status_code=409, detail=_nothing_to_plan(scope))
 
         try:
             plan_id = await store.save_plan(
@@ -354,6 +360,14 @@ async def create_plan(
 
         await store.finish_generation(connection, generation_id, "saved", plan_id)
         return await get_plan(str(plan_id), request, user, tenant, connection)
+
+
+def _nothing_to_plan(scope) -> str:
+    """One sentence for both refusals, so a student cannot get two wordings for one fact."""
+    return (
+        f"There is nothing published under '{scope.node['title']}' to build a plan "
+        "from yet."
+    )
 
 
 async def _tenant_of(connection: asyncpg.Connection, firebase_uid: str) -> str:

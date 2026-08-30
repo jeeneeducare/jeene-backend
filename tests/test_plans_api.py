@@ -506,6 +506,45 @@ def test_a_reservation_in_flight_holds_an_active_slot():
 def test_an_abandoned_reservation_stops_holding_a_slot():
     """A process that dies mid-generation must not cost a student a slot for ever."""
     source = inspect.getsource(store.reserve_generation)
-    assert "IN_FLIGHT_WINDOW" in source
+    assert "IN_FLIGHT_MINUTES" in source
     assert "outcome = 'started'" in source
-    assert store.IN_FLIGHT_WINDOW == "5 minutes"
+    assert store.IN_FLIGHT_MINUTES == 5
+
+
+def test_no_value_is_ever_written_into_the_sql():
+    """CLAUDE.md rule 4, and it says "no exceptions".
+
+    The window was `"5 minutes"` interpolated into `interval '{...}'`. A module constant,
+    so not injectable — but the shape only stays safe while nobody makes it configurable,
+    and the alternative is one bound argument. Column lists are a different thing: they
+    cannot be bound, and interpolating one is this codebase's existing idiom.
+    """
+    source = inspect.getsource(store.reserve_generation)
+    assert "make_interval(mins => $2)" in source
+    # The rule is about interpolation, not about the word "interval": `interval '1 hour'`
+    # written directly in a query is a SQL literal and is fine. Every SQL string in this
+    # module is triple-quoted, so the thing to forbid is a triple-quoted *f-string*. The
+    # f-string that builds the refusal message is not SQL and is none of this rule's
+    # business.
+    assert 'f"""' not in source
+
+
+def test_an_unplannable_scope_costs_nothing():
+    """Five taps on a chapter with no published questions used to cost five model calls
+    and all five of a student's hourly slots, and give them nothing.
+
+    The inventory is a read; building it is the cheap half of this route. So it is built
+    first, and a scope that cannot produce a plan is refused on the free side of the line.
+    """
+    source = inspect.getsource(plans_router.create_plan)
+    inventory_at = source.index("build_inventory")
+    refusal_at = source.index("if not inventory.question_buckets:")
+    reserve_at = source.index("reserve_generation")
+    generate_at = source.index("await _generate(inventory)")
+    assert inventory_at < refusal_at < reserve_at < generate_at
+
+
+def test_both_refusals_for_an_empty_scope_say_the_same_thing():
+    """One fact, one wording — the early refusal and the backstop are the same sentence."""
+    source = inspect.getsource(plans_router.create_plan)
+    assert source.count("_nothing_to_plan(scope)") == 2

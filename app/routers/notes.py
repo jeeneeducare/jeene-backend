@@ -338,29 +338,40 @@ async def notes_file(
         raise HTTPException(status_code=502, detail=_STORAGE_REFUSED)
 
     declared = upstream.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > _MAX_BYTES:
+    promised = int(declared) if declared and declared.isdigit() else None
+    if promised is not None and promised > _MAX_BYTES:
         await upstream.aclose()
         await client.aclose()
         raise HTTPException(status_code=502, detail=_STORAGE_REFUSED)
+
+    # Stop at exactly what we are about to promise, so the two can never disagree.
+    # Forwarding a Content-Length and then stopping short of it hands the reader a
+    # truncated PDF that claims to be whole — a broken document *and* a broken response,
+    # from a single upstream that lied about its size.
+    limit = promised if promised is not None else _MAX_BYTES
 
     async def body():
         sent = 0
         try:
             async for chunk in upstream.aiter_bytes(_CHUNK):
+                if sent + len(chunk) > limit:
+                    # Only reachable when upstream sends more than it said it would, or
+                    # more than the cap. Either way this is the last byte we relay.
+                    logger.error(
+                        "Notes for %s sent more than %d bytes; stopping",
+                        chapter_id, limit,
+                    )
+                    yield chunk[: limit - sent]
+                    return
                 sent += len(chunk)
-                if sent > _MAX_BYTES:
-                    # The header is upstream's claim; this is what actually arrived. A
-                    # response that lies about its length is exactly the one to stop.
-                    logger.error("Notes for %s exceeded the size cap", chapter_id)
-                    break
                 yield chunk
         finally:
             await upstream.aclose()
             await client.aclose()
 
     headers = {"Cache-Control": "private, max-age=600"}
-    if declared:
-        headers["Content-Length"] = declared
+    if promised is not None:
+        headers["Content-Length"] = str(promised)
     return StreamingResponse(body(), media_type="application/pdf", headers=headers)
 
 
