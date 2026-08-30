@@ -675,3 +675,111 @@ def test_generating_a_plan_does_not_hold_a_pooled_connection(client, monkeypatch
         f"{seen['size'] - seen['idle']} connection(s) held during generation; "
         "the wait must not occupy the pool"
     )
+
+
+# --- finding a scope from what a student typed ---------------------------------------
+#
+# The ranking is the half of JM-12 that only a database can check: the scoring is a SQL
+# CASE over a normalised title, and whether "Laws of Motion" beats "The second law" is
+# decided by rows, not by Python.
+
+
+def _scopes(client, q, **params):
+    response = client.get("/plans/scopes", params={"q": q, **params})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@integration
+def test_a_chapter_named_exactly_comes_back_first_and_marked_exact(client):
+    [top, *_] = _scopes(client, "Gravitation")
+    assert top["node_id"] == CHAPTER
+    assert top["exact"] is True
+    # Everything the app needs to start an intake without another round trip.
+    assert top["chapter_node_id"] == CHAPTER
+    assert top["subject_name"] == "Physics"
+    assert top["question_count"] > 0
+
+
+@integration
+def test_a_whole_sentence_finds_the_chapter_inside_it(client):
+    # The cleaned form is what matches here: "i want to study gravitation" is not a
+    # title, but with the asking-words removed it is.
+    [top, *_] = _scopes(client, "i want to study gravitation")
+    assert top["node_id"] == CHAPTER
+    assert top["exact"] is True
+
+
+@integration
+def test_a_title_made_of_ordinary_english_still_matches_exactly(client):
+    # "of" is a stop-word, so only the raw form can match this title. This is the case
+    # that justifies keeping both.
+    [top, *_] = _scopes(client, "laws of motion")
+    assert top["title"] == "Laws of Motion"
+    assert top["exact"] is True
+
+
+@integration
+def test_a_topic_can_be_named_directly(client):
+    [top, *_] = _scopes(client, "gravitational field")
+    assert top["node_id"] == "phy_11_ch8_t1"
+    assert top["type"] == "topic"
+    # A topic still reports the chapter above it — beginIntake reads the record by it.
+    assert top["chapter_node_id"] == CHAPTER
+
+
+@integration
+def test_a_keyword_finds_a_chapter_whose_title_does_not_contain_the_word(client):
+    # 'newton' is in Laws of Motion's search_keywords, not in its title.
+    titles = {m["title"] for m in _scopes(client, "newton")}
+    assert "Laws of Motion" in titles
+
+
+@integration
+def test_nothing_in_the_syllabus_is_an_empty_list_not_an_error(client):
+    assert _scopes(client, "quidditch") == []
+
+
+@integration
+def test_asking_words_alone_find_nothing(client):
+    assert _scopes(client, "i want to study the chapter") == []
+
+
+@integration
+def test_a_wildcard_is_matched_literally_and_not_as_a_pattern(client):
+    # If '%' ever reached a LIKE pattern this would return the whole syllabus.
+    assert _scopes(client, "%") == []
+    assert _scopes(client, "gravitation%") != []   # the '%' is simply dropped
+
+
+@integration
+def test_concepts_and_subjects_are_never_offered_as_scopes(client):
+    # 'Variation of g with height' is a concept, and a concept is too small to plan.
+    for match in _scopes(client, "variation of g with height", limit=10):
+        assert match["type"] in {"chapter", "topic", "subtopic"}
+    for match in _scopes(client, "physics", limit=10):
+        assert match["type"] != "subject"
+
+
+@integration
+def test_the_limit_is_honoured(client):
+    assert len(_scopes(client, "gravity", limit=1)) <= 1
+
+
+@integration
+def test_a_found_scope_can_be_planned_without_a_409(client):
+    # The whole point of the question-count filter: what search offers, create accepts.
+    _as(client, SCRATCH)
+    try:
+        [top, *_] = _scopes(client, "Gravitation")
+        response = client.post(
+            "/plans",
+            json={
+                "scope_node_id": top["node_id"],
+                "proficiency": "basic",
+                "intent": "first_time",
+            },
+        )
+        assert response.status_code == 201, response.text
+    finally:
+        _as(client, STUDENT)

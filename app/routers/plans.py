@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.auth import DEFAULT_TENANT, current_tenant, require_admin, require_user
 from app.config import settings
 from app.db import get_connection, get_pool
-from app.plans import remediate, store
+from app.plans import lookup, remediate, store
 from app.plans.generate import generate
 from app.plans.prompt import PROMPT_VERSION
 from app.plans.inventory import build_inventory
@@ -51,6 +51,7 @@ from app.schemas import (
     PlanStep,
     PlanStepItem,
     PlanSummary,
+    ScopeMatch,
     StepItems,
 )
 
@@ -118,6 +119,35 @@ async def placement_check(
         salt=node_id,
     )
     return await fetch_questions_by_ids(connection, tenant, ids)
+
+
+@router.get("/scopes", response_model=list[ScopeMatch])
+async def search_scopes(
+    q: str = Query(..., description="What the student typed."),
+    limit: int = Query(default=lookup.DEFAULT_LIMIT, ge=1, le=lookup.MAX_LIMIT),
+    class_level: int | None = Query(default=None, ge=1),
+    exam: str | None = Query(default=None),
+    user: dict = Depends(require_user),
+    tenant: str = Depends(current_tenant),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[ScopeMatch]:
+    """What a student could have meant, for a student who typed instead of tapping.
+
+    Declared above `GET /{plan_id}`: FastAPI matches in declaration order, and below it
+    "scopes" would be read as a plan id and 404.
+
+    No model runs here. The words are matched against titles and the pipeline's
+    `search_keywords` in Postgres, and only scopes with something published to practise
+    come back — offering one without questions would be offering a dead end, since
+    `create_plan` refuses exactly that with a 409.
+
+    An empty list is a result, not an error: a student can name something that is not in
+    the syllabus, and the app has a better answer for that than a red toast.
+    """
+    rows = await lookup.search_scopes(
+        connection, tenant, q, limit=limit, class_level=class_level, exam=exam
+    )
+    return [ScopeMatch(**row) for row in rows]
 
 
 @router.get("/{plan_id}", response_model=PlanDetail)

@@ -590,6 +590,27 @@ class PlanDetail(PlanSummary):
     steps: list[PlanStep] = []
 
 
+class ScopeMatch(BaseModel):
+    """A scope a student's typed words could have meant.
+
+    `exact` is the only field the app acts on without asking: it means the query, once
+    punctuation and asking-words were removed, *was* this title. Anything less than that
+    is a suggestion, and a suggestion gets confirmed — a wrong guess spends one of the
+    three plans a student is allowed to have open and a paid generation with it.
+    """
+
+    node_id: str
+    title: str
+    type: Literal["chapter", "topic", "subtopic"]
+    chapter_node_id: str | None = None
+    chapter_title: str | None = None
+    subject_id: str | None = None
+    subject_name: str | None = None
+    class_level: int | None = None
+    question_count: int = 0
+    exact: bool = False
+
+
 class PlanCreate(BaseModel):
     scope_node_id: str
     proficiency: Literal["basic", "intermediate", "advanced"]
