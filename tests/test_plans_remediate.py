@@ -62,6 +62,10 @@ def clean(request):
             await conn.execute(
                 "DELETE FROM study_plans WHERE firebase_uid = $1", STUDENT
             )
+            # The spend ledger too: a deleted plan does not refund its generation.
+            await conn.execute(
+                "DELETE FROM plan_generations WHERE firebase_uid = $1", STUDENT
+            )
             await conn.execute("DELETE FROM attempts WHERE firebase_uid = $1", STUDENT)
         finally:
             await conn.close()
@@ -260,3 +264,58 @@ def test_the_same_concept_is_not_added_twice(client):
     assert len(concepts) == len(set(concepts)), concepts
     titles = [s["title"] for s in added]
     assert len(titles) == len(set(titles)), titles
+
+
+@integration
+def test_handing_in_twice_adds_work_only_once(client):
+    """Submitting a missed checkpoint again must be a no-op, not a second round.
+
+    This is the sequential half of the guarantee, and it is what this harness can
+    honestly test: `TestClient` does not give real parallelism, so a test that fired two
+    submits at once passed with the row lock *removed* and proved nothing. The
+    concurrent half is asserted below by reading the source, and was verified against a
+    real server with two simultaneous requests — before the fix that pair returned one
+    200 and one 500.
+    """
+    plan = _plan(client)
+    checkpoint = _checkpoint(plan)
+    opened = _open(client, plan["plan_id"], checkpoint["step_id"])
+    _answer([q["question_id"] for q in opened["questions"]], correct=False)
+
+    url = f"/plans/{plan['plan_id']}/checkpoint/submit"
+    first = client.post(url).json()
+    second = client.post(url).json()
+
+    assert len(first["added_steps"]) > 0
+    assert second["added_steps"] == [], "the second submit must not remediate again"
+
+    steps = client.get(f"/plans/{plan['plan_id']}").json()["steps"]
+    rounds = {s["remediation_round"] for s in steps if s["remediation_round"] > 0}
+    assert rounds == {1}, rounds
+
+
+def test_the_submit_holds_the_plan_row_for_the_whole_decision():
+    """The concurrent half, which a synchronous test client cannot exercise.
+
+    Appending steps and clearing the checkpoint were separate writes. Two simultaneous
+    submits read the same frozen questions, both remediated, and the second insert died
+    on the unique constraint — a 500 for double-tapping a button. Both are now inside one
+    transaction that holds the plan's row, so the second waits and then sees a checkpoint
+    that has already been cleared.
+    """
+    import inspect
+
+    from app.plans import store
+    from app.routers import plans as plans_router
+
+    assert "FOR UPDATE" in inspect.getsource(store.lock_plan)
+
+    source = inspect.getsource(plans_router.submit_checkpoint)
+    assert "async with connection.transaction():" in source
+    assert "store.lock_plan" in source
+    # The lock must be taken before anything is read, or it guards nothing.
+    assert source.index("lock_plan") < source.index("items_for")
+    # ...and both writes must be inside it.
+    transaction_at = source.index("async with connection.transaction():")
+    assert transaction_at < source.index("_remediate(")
+    assert transaction_at < source.index("set_plan_status")

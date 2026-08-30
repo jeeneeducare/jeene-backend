@@ -185,6 +185,11 @@ def test_the_file_route_streams_what_storage_returns(client, monkeypatch):
         "AsyncClient",
         lambda **kw: real(transport=httpx.MockTransport(storage), **kw),
     )
+    # The seed's host is reserved and does not resolve, so the SSRF guard refuses it
+    # before any stub is reached. Naming it is what an operator would do for a real one.
+    monkeypatch.setattr(
+        notes_router.settings, "jeene_notes_storage_hosts", "cdn.example"
+    )
 
     token = assets.sign("notes", CHAPTER)
     response = client.get(f"/notes/{CHAPTER}/file", params={"t": token})
@@ -213,6 +218,11 @@ def test_storage_being_down_is_a_502_not_a_traceback(client, monkeypatch):
         notes_router.httpx,
         "AsyncClient",
         lambda **kw: real(transport=httpx.MockTransport(storage), **kw),
+    )
+    # The seed's host is reserved and does not resolve, so the SSRF guard refuses it
+    # before any stub is reached. Naming it is what an operator would do for a real one.
+    monkeypatch.setattr(
+        notes_router.settings, "jeene_notes_storage_hosts", "cdn.example"
     )
 
     token = assets.sign("notes", CHAPTER)
@@ -267,3 +277,94 @@ def test_the_viewer_page_does_not_declare_a_global_named_status(client):
     code = re.sub(r"//.*", "", page)
 
     assert not re.search(r"\b(var|let|const)\s+status\b", code)
+
+
+# --- what the file route will and will not fetch ---------------------------------------
+
+def test_an_internal_address_is_refused(monkeypatch):
+    """The finding, as a test.
+
+    Before this guard, `pdf_url = http://127.0.0.1:8000/health` made the endpoint fetch it
+    and hand the body back to the caller. The same shape on a cloud host reaches the
+    instance metadata service.
+    """
+    from fastapi import HTTPException
+
+    from app.routers import notes as notes_router
+
+    monkeypatch.setattr(notes_router.settings, "jeene_notes_storage_hosts", None)
+    for url in (
+        "http://127.0.0.1:8000/health",
+        "https://127.0.0.1/x.pdf",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://10.0.0.5/x.pdf",
+        "https://192.168.1.1/x.pdf",
+        "https://localhost/x.pdf",
+        "https://[::1]/x.pdf",
+    ):
+        with pytest.raises(HTTPException) as raised:
+            notes_router._check_storage_url(url)
+        assert raised.value.status_code == 502, url
+
+
+def test_plain_http_is_refused_when_no_host_is_named(monkeypatch):
+    from fastapi import HTTPException
+
+    from app.routers import notes as notes_router
+
+    monkeypatch.setattr(notes_router.settings, "jeene_notes_storage_hosts", None)
+    with pytest.raises(HTTPException):
+        notes_router._check_storage_url("http://example.com/x.pdf")
+
+
+def test_naming_a_host_is_how_a_local_setup_opts_in(monkeypatch):
+    from fastapi import HTTPException
+
+    from app.routers import notes as notes_router
+
+    monkeypatch.setattr(
+        notes_router.settings, "jeene_notes_storage_hosts", "storage.test, 127.0.0.1"
+    )
+    # Named: allowed, scheme and address not policed — the operator said what they meant.
+    notes_router._check_storage_url("http://127.0.0.1:55480/notes.pdf")
+    notes_router._check_storage_url("https://storage.test/notes.pdf")
+    # Not named: refused, even though it would pass the default rule.
+    with pytest.raises(HTTPException):
+        notes_router._check_storage_url("https://example.com/notes.pdf")
+
+
+def test_the_refusal_says_nothing_about_which_check_failed(monkeypatch):
+    """Telling a caller why a fetch was refused tells them how to shape the next one."""
+    from fastapi import HTTPException
+
+    from app.routers import notes as notes_router
+
+    monkeypatch.setattr(notes_router.settings, "jeene_notes_storage_hosts", None)
+    messages = set()
+    for url in ("http://example.com/x.pdf", "https://127.0.0.1/x.pdf", "https:///x.pdf"):
+        with pytest.raises(HTTPException) as raised:
+            notes_router._check_storage_url(url)
+        messages.add(raised.value.detail)
+    assert len(messages) == 1, messages
+
+
+def test_redirects_are_not_followed():
+    """A 302 from an allowed host is how the allow-list gets walked around."""
+    import inspect
+
+    from app.routers import notes as notes_router
+
+    source = inspect.getsource(notes_router.notes_file)
+    assert "follow_redirects=False" in source
+
+
+def test_there_is_a_size_cap_on_what_is_relayed():
+    import inspect
+
+    from app.routers import notes as notes_router
+
+    source = inspect.getsource(notes_router.notes_file)
+    assert "_MAX_BYTES" in source
+    # Both the claim and what actually arrives — a response that lies about its length is
+    # exactly the one worth stopping.
+    assert source.count("_MAX_BYTES") >= 2

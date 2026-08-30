@@ -23,5 +23,10 @@ class Settings(BaseSettings):
     # with its own random secret, which is correct for one worker and broken for two.
     jeene_asset_secret: str | None = None
 
+    # Hosts the notes viewer may stream a PDF from, comma-separated. Empty means "any
+    # public https host", which is the safe default; naming hosts is stricter still and
+    # is also how a local setup permits a plain-http fixture server.
+    jeene_notes_storage_hosts: str | None = None
+
 
 settings = Settings()

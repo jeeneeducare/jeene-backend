@@ -34,6 +34,12 @@ MAX_PLANS_PER_DAY = 10
 # made each other unusable, and only running the sequence showed it.
 MAX_PLANS_PER_HOUR = 5
 
+#: How long a reservation can be in flight before it stops holding an active-plan slot.
+#: Comfortably past the worst case for generation (two attempts at forty-five seconds),
+#: and short enough that a crash costs a student one slot for a couple of minutes rather
+#: than until somebody notices.
+IN_FLIGHT_WINDOW = "5 minutes"
+
 # Columns the plan list and the plan detail both need. Named rather than starred so a
 # column added later has to be asked for.
 _PLAN_COLUMNS = """
@@ -93,6 +99,32 @@ async def get_plan(connection: asyncpg.Connection, plan_id: str, firebase_uid: s
     )
 
 
+async def lock_plan(connection: asyncpg.Connection, plan_id: str, firebase_uid: str):
+    """The owner's plan row, held until the transaction ends.
+
+    Same scoping as `get_plan` — the uid is in the `WHERE`, so somebody else's plan is
+    indistinguishable from one that does not exist — plus a row lock.
+
+    The lock is what makes handing in a checkpoint safe to do twice at once. Submitting a
+    missed one appends steps *and* clears the checkpoint, and those were separate writes:
+    two simultaneous submits both read the same frozen questions, both remediated, and
+    the second insert hit the unique constraint on (plan_id, position) — a 500 in the
+    student's face for double-tapping a button. With the lock the second waits, and then
+    reads a checkpoint that has already been cleared, so it correctly adds nothing.
+
+    Must be called inside a transaction; the lock is released when it ends.
+    """
+    return await connection.fetchrow(
+        f"""
+        SELECT {_PLAN_COLUMNS} FROM study_plans
+         WHERE plan_id = $1::uuid AND firebase_uid = $2
+           FOR UPDATE
+        """,
+        str(plan_id),
+        firebase_uid,
+    )
+
+
 async def active_plans(connection: asyncpg.Connection, firebase_uid: str):
     return await connection.fetch(
         """
@@ -104,24 +136,128 @@ async def active_plans(connection: asyncpg.Connection, firebase_uid: str):
     )
 
 
-async def recent_plan_counts(
-    connection: asyncpg.Connection, firebase_uid: str
-) -> tuple[int, int]:
-    """(created in the last hour, created in the last day).
+class LimitReached(Exception):
+    """A student has hit one of the two caps.
 
-    Counts every plan ever created in the window, whatever became of it. Counting only
-    active ones would make "create, archive, repeat" a way around the limit, which is
-    exactly the loop a bored student finds first.
+    Carries the HTTP status the router should use, so the decision about *which* limit
+    was reached stays with the code that knows the limits, and the router only has to
+    translate. Not an HTTPException, because the store has no business importing FastAPI.
     """
-    row = await connection.fetchrow(
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+async def reserve_generation(
+    connection: asyncpg.Connection,
+    firebase_uid: str,
+    tenant: str,
+    scope_node_id: str,
+):
+    """Take one plan's worth of a student's allowance, or refuse.
+
+    Everything here is inside one transaction behind a per-student advisory lock, and
+    that is the entire point. The checks used to be three reads followed, much later, by
+    a write; between them was a window wide enough to drive six concurrent requests
+    through a cap of three — and each one was a paid model call, so the limit that was
+    supposed to bound the bill bounded nothing.
+
+    The lock is per student rather than global: two students planning at once do not wait
+    for each other, and one student planning twice at once is exactly the case being
+    serialised. `hashtext` can collide, which costs two unlucky students a few
+    milliseconds of waiting and nothing else.
+
+    Returns the generation id. The caller **must** resolve it with `finish_generation`,
+    but a row that never resolves is not a leak: it still counts, which is the honest
+    answer when a model call was made and the process then died.
+    """
+    async with connection.transaction():
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1))", firebase_uid
+        )
+
+        active = await connection.fetch(
+            """
+            SELECT plan_id, scope_title, updated_at FROM study_plans
+             WHERE firebase_uid = $1 AND status = 'active'
+             ORDER BY updated_at
+            """,
+            firebase_uid,
+        )
+        # Reservations that have not resolved yet are plans about to exist. Without
+        # counting them, the active cap is back to being check-then-act: the plan row is
+        # not written until after generation, so six requests through this lock would
+        # each see the same empty list and each reserve a slot. Measured: five plans
+        # against a cap of three.
+        #
+        # Bounded by age, because a process that died mid-generation must not hold a slot
+        # for ever. Generation is allowed ninety seconds at the outside; anything older
+        # than IN_FLIGHT_WINDOW is not coming back.
+        in_flight = await connection.fetchval(
+            f"""
+            SELECT count(*) FROM plan_generations
+             WHERE firebase_uid = $1 AND outcome = 'started'
+               AND created_at > now() - interval '{IN_FLIGHT_WINDOW}'
+            """,
+            firebase_uid,
+        )
+        if len(active) + in_flight >= MAX_ACTIVE_PLANS:
+            if not active:
+                # Every slot is held by something still being built, which is a race
+                # rather than a full shelf, and telling them to archive nothing would be
+                # nonsense.
+                raise LimitReached(
+                    409, "A plan is already being built for you. Give it a moment."
+                )
+            raise LimitReached(
+                409,
+                f"You already have {len(active)} plans on the go. Archive one first — "
+                f"'{active[0]['scope_title']}' is the one you have not touched in "
+                "longest.",
+            )
+
+        spend = await connection.fetchrow(
+            """
+            SELECT COUNT(*) FILTER (WHERE created_at > now() - interval '1 hour') AS hour,
+                   COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')  AS day
+              FROM plan_generations WHERE firebase_uid = $1
+            """,
+            firebase_uid,
+        )
+        if spend["hour"] >= MAX_PLANS_PER_HOUR:
+            raise LimitReached(
+                429, "That is a lot of new plans in an hour. Try again a bit later."
+            )
+        if spend["day"] >= MAX_PLANS_PER_DAY:
+            raise LimitReached(
+                429, "You have started a lot of plans today. Try again tomorrow."
+            )
+
+        generation_id = uuid.uuid4()
+        await connection.execute(
+            """
+            INSERT INTO plan_generations (generation_id, firebase_uid, tenant_id,
+                                          scope_node_id)
+            VALUES ($1, $2, $3, $4)
+            """,
+            generation_id, firebase_uid, tenant, scope_node_id,
+        )
+        return generation_id
+
+
+async def finish_generation(
+    connection: asyncpg.Connection, generation_id, outcome: str, plan_id=None
+) -> None:
+    """Record what became of a reservation. Never changes whether it counted."""
+    await connection.execute(
         """
-        SELECT COUNT(*) FILTER (WHERE created_at > now() - interval '1 hour') AS hour,
-               COUNT(*) FILTER (WHERE created_at > now() - interval '1 day')  AS day
-          FROM study_plans WHERE firebase_uid = $1
+        UPDATE plan_generations SET outcome = $2, plan_id = $3
+         WHERE generation_id = $1::uuid
         """,
-        firebase_uid,
+        str(generation_id), outcome, plan_id,
     )
-    return row["hour"], row["day"]
 
 
 async def steps_for(connection: asyncpg.Connection, plan_id) -> list:

@@ -18,9 +18,9 @@ import asyncpg
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from app.auth import current_tenant, require_admin, require_user
+from app.auth import DEFAULT_TENANT, current_tenant, require_admin, require_user
 from app.config import settings
-from app.db import get_connection
+from app.db import get_connection, get_pool
 from app.plans import remediate, store
 from app.plans.generate import generate
 from app.plans.prompt import PROMPT_VERSION
@@ -241,8 +241,6 @@ async def create_plan(
     body: PlanCreate,
     request: Request,
     user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
-    connection: asyncpg.Connection = Depends(get_connection),
 ) -> PlanDetail:
     """Plan a scope, or hand back the plan already running for it.
 
@@ -250,73 +248,125 @@ async def create_plan(
     this" again on a topic they started last week wants their finished steps, not a fresh
     plan that makes the work look undone. So the existing-plan check comes before both
     limits — resuming is neither a new plan nor a spend.
+
+    **This route manages its own connections, and does not take one from the dependency.**
+    Writing a plan means calling a model, which is allowed forty-five seconds and gets two
+    attempts, so a request can spend a minute and a half doing nothing but waiting. A
+    pooled connection held across that is a connection nobody else can have — and with a
+    pool of five, five students planning at once made the whole API unavailable to
+    everybody else. So the work is in three phases and the middle one, which is all of the
+    waiting, holds nothing.
     """
-    existing = await store.active_plan_for_scope(
-        connection, user["uid"], body.scope_node_id
-    )
-    if existing is not None:
-        return await get_plan(
-            str(existing["plan_id"]), request, user, tenant, connection
-        )
+    pool = get_pool()
 
-    await _check_limits(connection, user["uid"])
+    # Phase one: decide, and reserve. Milliseconds, and the only part that is serialised
+    # per student.
+    async with pool.acquire() as connection:
+        tenant = await _tenant_of(connection, user["uid"])
 
-    scope = await resolve_scope(connection, body.scope_node_id, tenant)
-    if scope is None:
-        raise HTTPException(status_code=404, detail=_no_scope(body.scope_node_id))
-
-    inventory = await build_inventory(
-        connection,
-        scope,
-        tenant,
-        firebase_uid=user["uid"],
-        proficiency=body.proficiency,
-        intent=body.intent,
-        placement=_placement(body),
-    )
-    plan, origin, provider, model = await _generate(inventory)
-    if not plan.steps:
-        # Nothing published under this scope. A plan row with no steps is worse than an
-        # error: it sits in the history looking like work the student failed to do.
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"There is nothing published under '{scope.node['title']}' to build a "
-                "plan from yet."
-            ),
-        )
-
-    try:
-        plan_id = await store.save_plan(
-            connection,
-            firebase_uid=user["uid"],
-            tenant=tenant,
-            scope_node_id=scope.node["node_id"],
-            scope_type=scope.node["type"],
-            scope_title=scope.node["title"],
-            proficiency=body.proficiency,
-            intent=body.intent,
-            origin=origin,
-            prompt_version=PROMPT_VERSION,
-            accuracy_at_generation=inventory.student.scope_accuracy,
-            plan=plan,
-            subject=inventory.scope.subject,
-            provider=provider,
-            model=model,
-        )
-    except UniqueViolationError:
-        # Two taps, two workers, one scope. The partial unique index is what makes
-        # "plan this" idempotent, and losing that race is a resume rather than an error:
-        # the student asked for a plan for this scope and there is now exactly one.
         existing = await store.active_plan_for_scope(
             connection, user["uid"], body.scope_node_id
         )
-        if existing is None:
-            raise
-        return await get_plan(
-            str(existing["plan_id"]), request, user, tenant, connection
+        if existing is not None:
+            return await get_plan(
+                str(existing["plan_id"]), request, user, tenant, connection
+            )
+
+        scope = await resolve_scope(connection, body.scope_node_id, tenant)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=_no_scope(body.scope_node_id))
+
+        try:
+            generation_id = await store.reserve_generation(
+                connection, user["uid"], tenant, body.scope_node_id
+            )
+        except store.LimitReached as limit:
+            raise HTTPException(
+                status_code=limit.status, detail=limit.detail
+            ) from limit
+
+        inventory = await build_inventory(
+            connection,
+            scope,
+            tenant,
+            firebase_uid=user["uid"],
+            proficiency=body.proficiency,
+            intent=body.intent,
+            placement=_placement(body),
         )
-    return await get_plan(str(plan_id), request, user, tenant, connection)
+
+    # Phase two: the wait. No connection is held here, on purpose.
+    try:
+        plan, origin, provider, model = await _generate(inventory)
+    except BaseException:
+        # Including cancellation: a student who closed the app still spent the call, and
+        # the reservation says so. Only the outcome is being recorded.
+        async with pool.acquire() as connection:
+            await store.finish_generation(connection, generation_id, "failed")
+        raise
+
+    # Phase three: write it down.
+    async with pool.acquire() as connection:
+        if not plan.steps:
+            # Nothing published under this scope. A plan row with no steps is worse than
+            # an error: it sits in the history looking like work the student failed to do.
+            await store.finish_generation(connection, generation_id, "failed")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"There is nothing published under '{scope.node['title']}' to build "
+                    "a plan from yet."
+                ),
+            )
+
+        try:
+            plan_id = await store.save_plan(
+                connection,
+                firebase_uid=user["uid"],
+                tenant=tenant,
+                scope_node_id=scope.node["node_id"],
+                scope_type=scope.node["type"],
+                scope_title=scope.node["title"],
+                proficiency=body.proficiency,
+                intent=body.intent,
+                origin=origin,
+                prompt_version=PROMPT_VERSION,
+                accuracy_at_generation=inventory.student.scope_accuracy,
+                plan=plan,
+                subject=inventory.scope.subject,
+                provider=provider,
+                model=model,
+            )
+        except UniqueViolationError:
+            # Two taps, two workers, one scope. The partial unique index is what makes
+            # "plan this" idempotent, and losing that race is a resume rather than an
+            # error: the student asked for a plan for this scope and there is now exactly
+            # one. The reservation is still spent, because the call was still made.
+            await store.finish_generation(connection, generation_id, "failed")
+            existing = await store.active_plan_for_scope(
+                connection, user["uid"], body.scope_node_id
+            )
+            if existing is None:
+                raise
+            return await get_plan(
+                str(existing["plan_id"]), request, user, tenant, connection
+            )
+
+        await store.finish_generation(connection, generation_id, "saved", plan_id)
+        return await get_plan(str(plan_id), request, user, tenant, connection)
+
+
+async def _tenant_of(connection: asyncpg.Connection, firebase_uid: str) -> str:
+    """The same rule as the `current_tenant` dependency, without holding a connection.
+
+    This route cannot use that dependency: FastAPI keeps a yielded dependency alive until
+    the response is sent, so depending on it would hold a pooled connection for the whole
+    request — which is the thing this route is arranged to avoid.
+    """
+    tenant = await connection.fetchval(
+        "SELECT tenant_id FROM users WHERE firebase_uid = $1", firebase_uid
+    )
+    return tenant or DEFAULT_TENANT
 
 
 @router.post("/{plan_id}/steps/{step_id}/complete", response_model=PlanDetail)
@@ -395,55 +445,60 @@ async def submit_checkpoint(
     only key is answering the questions whose answers they have just read. See
     `app/plans/remediate.py`.
     """
-    plan = await store.get_plan(connection, plan_id, user["uid"])
-    if plan is None:
-        raise HTTPException(status_code=404, detail="Plan not found")
+    # Everything below is one transaction, holding the plan's row. Handing in a missed
+    # checkpoint appends steps *and* clears the checkpoint; those were separate writes,
+    # so two simultaneous submits both saw the same frozen questions and the second one
+    # died on the unique constraint. See `store.lock_plan`.
+    async with connection.transaction():
+        plan = await store.lock_plan(connection, plan_id, user["uid"])
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Plan not found")
 
-    steps = await store.steps_for(connection, plan["plan_id"])
-    checkpoint = next(
-        (s for s in steps if s["completion_kind"] == "checkpoint"), None
-    )
-    if checkpoint is None:
-        raise HTTPException(status_code=404, detail="This plan has no checkpoint")
-
-    items = await store.items_for(connection, [checkpoint["step_id"]])
-    progress = await step_progress(
-        connection, tenant, user["uid"], checkpoint, _frozen_ids(items)
-    )
-
-    by_plan, by_step = await _derived_states(
-        connection, [plan["plan_id"]], user["uid"], tenant
-    )
-    # The checkpoint's own state comes from the read above, which was taken after its
-    # items were frozen; the bulk query may have been computed from the same rows but is
-    # re-stated here so the two can never disagree about the step being submitted.
-    by_step[checkpoint["step_id"]] = (
-        progress.state, progress.answered, progress.correct
-    )
-    states = [
-        by_step.get(s["step_id"], ("pending", 0, 0))[0] for s in steps
-    ]
-
-    status = plan["status"]
-    added: list = []
-    if progress.state == "done":
-        if plan_is_complete(states) and status == "active":
-            await store.set_plan_status(connection, plan_id, "completed")
-            status = "completed"
-        else:
-            await store.touch(connection, plan_id)
-    else:
-        added = await _remediate(
-            connection,
-            plan_id=plan_id,
-            tenant=tenant,
-            firebase_uid=user["uid"],
-            plan=plan,
-            checkpoint=checkpoint,
-            checkpoint_items=items,
-            question_ids=_frozen_ids(items),
+        steps = await store.steps_for(connection, plan["plan_id"])
+        checkpoint = next(
+            (s for s in steps if s["completion_kind"] == "checkpoint"), None
         )
-        await store.touch(connection, plan_id)
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail="This plan has no checkpoint")
+
+        items = await store.items_for(connection, [checkpoint["step_id"]])
+        progress = await step_progress(
+            connection, tenant, user["uid"], checkpoint, _frozen_ids(items)
+        )
+
+        by_plan, by_step = await _derived_states(
+            connection, [plan["plan_id"]], user["uid"], tenant
+        )
+        # The checkpoint's own state comes from the read above, which was taken after its
+        # items were frozen; the bulk query may have been computed from the same rows but is
+        # re-stated here so the two can never disagree about the step being submitted.
+        by_step[checkpoint["step_id"]] = (
+            progress.state, progress.answered, progress.correct
+        )
+        states = [
+            by_step.get(s["step_id"], ("pending", 0, 0))[0] for s in steps
+        ]
+
+        status = plan["status"]
+        added: list = []
+        if progress.state == "done":
+            if plan_is_complete(states) and status == "active":
+                await store.set_plan_status(connection, plan_id, "completed")
+                status = "completed"
+            else:
+                await store.touch(connection, plan_id)
+        else:
+            added = await _remediate(
+                connection,
+                plan_id=plan_id,
+                tenant=tenant,
+                firebase_uid=user["uid"],
+                plan=plan,
+                checkpoint=checkpoint,
+                checkpoint_items=items,
+                question_ids=_frozen_ids(items),
+            )
+            await store.touch(connection, plan_id)
 
     return CheckpointResult(
         plan_id=str(plan["plan_id"]),
@@ -605,36 +660,6 @@ def _planner_provider():
     """Built once. The client holds a connection pool and rebuilding it per request
     would spend more time on TLS than on the plan."""
     return build_provider(settings.openai_api_key, settings.jeene_planner_model)
-
-
-async def _check_limits(connection: asyncpg.Connection, firebase_uid: str) -> None:
-    """The two limits on creating a plan, both counted in the database.
-
-    Render runs more than one worker and restarts them freely, so an in-process counter
-    would be a limit that resets whenever the platform felt like it.
-    """
-    active = await store.active_plans(connection, firebase_uid)
-    if len(active) >= store.MAX_ACTIVE_PLANS:
-        oldest = active[0]
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"You already have {len(active)} plans on the go. Archive one first — "
-                f"'{oldest['scope_title']}' is the one you have not touched in longest."
-            ),
-        )
-
-    hour, day = await store.recent_plan_counts(connection, firebase_uid)
-    if hour >= store.MAX_PLANS_PER_HOUR:
-        raise HTTPException(
-            status_code=429,
-            detail="That is a lot of new plans in an hour. Try again a bit later.",
-        )
-    if day >= store.MAX_PLANS_PER_DAY:
-        raise HTTPException(
-            status_code=429,
-            detail="You have started a lot of plans today. Try again tomorrow.",
-        )
 
 
 async def _owned_step(

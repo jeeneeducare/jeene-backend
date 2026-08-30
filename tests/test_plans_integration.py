@@ -62,6 +62,10 @@ def clean_plans():
     async def wipe():
         conn = await asyncpg.connect(os.environ["DATABASE_URL"])
         await conn.execute("DELETE FROM study_plans")
+        # And the spend ledger. Deleting a plan does not refund its generation — that is
+        # deliberate, and it is why a suite that only cleared plans started tripping the
+        # hourly limit partway through.
+        await conn.execute("DELETE FROM plan_generations")
         # The seed's attempts are all backdated; anything at `now()` was written by a
         # test. Without this, one test's answers silently become the next test's record —
         # which is exactly what happened, and it moved a foundation step.
@@ -521,23 +525,27 @@ def test_the_spending_limit_is_counted_in_the_database_not_the_process(client):
 
     from app.plans import store
 
-    async def insert_plans(n):
+    async def insert_generations(n):
+        """The spend is counted over `plan_generations`, not over plans.
+
+        A generation that failed still cost money, and a plan that was deleted does not
+        refund one — so the ledger is what the limit reads, and it is what a second
+        worker would have written.
+        """
         conn = await asyncpg.connect(os.environ["DATABASE_URL"])
         for _ in range(n):
             await conn.execute(
                 """
-                INSERT INTO study_plans (plan_id, firebase_uid, tenant_id, scope_node_id,
-                                         scope_type, scope_title, proficiency, intent,
-                                         origin, prompt_version, status)
-                VALUES ($1, $2, 'JEENE_MASTER', $3, 'subtopic', 'x', 'basic',
-                        'first_time', 'fallback', 1, 'archived')
+                INSERT INTO plan_generations (generation_id, firebase_uid, tenant_id,
+                                              scope_node_id, outcome)
+                VALUES ($1, $2, 'JEENE_MASTER', $3, 'saved')
                 """,
                 uuid.uuid4(), STUDENT, SCOPE,
             )
         await conn.close()
 
     _as(client, STUDENT)
-    asyncio.run(insert_plans(store.MAX_PLANS_PER_HOUR))
+    asyncio.run(insert_generations(store.MAX_PLANS_PER_HOUR))
     refused = _create(client)
     assert refused.status_code == 429, refused.text
     assert "hour" in refused.json()["detail"].lower()
@@ -633,3 +641,37 @@ def test_a_step_never_asks_for_more_questions_than_it_has(client):
         "which can never be answered"
     )
     _as(client, STUDENT)
+
+
+@integration
+def test_generating_a_plan_does_not_hold_a_pooled_connection(client, monkeypatch):
+    """The pool has five connections and generation can take ninety seconds.
+
+    Held across that wait, five students planning at once made the whole API unavailable
+    to everybody else — browsing, attempts, sign-in. So this asserts the thing directly:
+    while generation is running, the connection this request used is back in the pool.
+    """
+    from app.db import get_pool
+    from app.routers import plans as plans_router
+
+    seen: dict = {}
+    original = plans_router._generate
+
+    async def watched(inventory):
+        pool = get_pool()
+        # Idle == size means nothing is checked out — including by us.
+        seen["idle"] = pool.get_idle_size()
+        seen["size"] = pool.get_size()
+        return await original(inventory)
+
+    monkeypatch.setattr(plans_router, "_generate", watched)
+
+    _as(client, FRESH)
+    assert _create(client).status_code == 201
+    _as(client, STUDENT)
+
+    assert seen, "generation never ran"
+    assert seen["idle"] == seen["size"], (
+        f"{seen['size'] - seen['idle']} connection(s) held during generation; "
+        "the wait must not occupy the pool"
+    )

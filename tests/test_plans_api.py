@@ -42,6 +42,20 @@ class _FakeConnection:
     async def execute(self, query, *args):
         self.calls.append((query, args))
 
+    def transaction(self):
+        """A no-op stand-in. These tests are about *which* statements run and in what
+        order; that they run inside a transaction is asserted separately, by reading the
+        source, because a fake cannot demonstrate atomicity."""
+
+        class _Noop:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Noop()
+
 
 USER = {"uid": "student-1"}
 
@@ -125,12 +139,13 @@ def test_a_fourth_active_plan_is_refused_and_says_which_to_archive():
             {"plan_id": "1", "scope_title": "Gravitation", "updated_at": None},
             {"plan_id": "2", "scope_title": "Thermodynamics", "updated_at": None},
             {"plan_id": "3", "scope_title": "Optics", "updated_at": None},
-        ]
+        ],
+        values=[0],  # nothing else being generated right now
     )
-    with pytest.raises(HTTPException) as raised:
-        asyncio.run(plans_router._check_limits(connection, "student-1"))
-    assert raised.value.status_code == 409
-    # active_plans orders by updated_at, so the first row is the stalest.
+    with pytest.raises(store.LimitReached) as raised:
+        asyncio.run(store.reserve_generation(connection, "student-1", "T", "n"))
+    assert raised.value.status == 409
+    # The active list is ordered by updated_at, so the first row is the stalest.
     assert "Gravitation" in raised.value.detail
 
 
@@ -148,33 +163,70 @@ def test_three_active_plans_is_the_cap_that_was_designed_for():
     ],
 )
 def test_the_spending_limits_are_counted_per_account(hour, day, status):
-    connection = _FakeConnection(rows=[], row={"hour": hour, "day": day})
+    connection = _FakeConnection(rows=[], row={"hour": hour, "day": day}, values=[0])
     if status is None:
-        asyncio.run(plans_router._check_limits(connection, "student-1"))
+        asyncio.run(store.reserve_generation(connection, "student-1", "T", "n"))
         return
-    with pytest.raises(HTTPException) as raised:
-        asyncio.run(plans_router._check_limits(connection, "student-1"))
-    assert raised.value.status_code == status
+    with pytest.raises(store.LimitReached) as raised:
+        asyncio.run(store.reserve_generation(connection, "student-1", "T", "n"))
+    assert raised.value.status == status
 
 
 def test_the_limits_are_counted_in_the_database_not_in_memory():
     """Render runs more than one worker and restarts them freely.
 
     An in-process counter would be a spending limit that resets whenever the platform
-    felt like it — which is exactly what `tests.py`'s handoff limiter is, for a case
-    where a restart only forgives.
+    felt like it.
     """
-    source = inspect.getsource(store.recent_plan_counts)
-    assert "FROM study_plans" in source
+    source = inspect.getsource(store.reserve_generation)
+    assert "FROM plan_generations" in source
     assert "interval '1 hour'" in source and "interval '1 day'" in source
     module = inspect.getsource(store)
     assert "_attempts: dict" not in module, "no in-process counter"
 
 
 def test_archiving_and_recreating_does_not_refund_the_quota():
-    """Create, archive, repeat is the loop a bored student finds first."""
-    source = inspect.getsource(store.recent_plan_counts)
-    assert "status" not in source, "the count must not filter on status"
+    """Create, archive, repeat is the loop a bored student finds first.
+
+    The spend is counted over `plan_generations`, which is append-only and has no status
+    to filter on, so deleting or archiving a plan cannot give the money back.
+    """
+    source = inspect.getsource(store.reserve_generation)
+    spend = source[source.index("plan_generations"):]
+    assert "status" not in spend, "the spend count must not filter on plan status"
+
+
+def test_the_decision_and_the_reservation_are_one_transaction():
+    """The whole finding, in one assertion.
+
+    Three reads and a much later write is not a limit. Six concurrent requests went
+    through a cap of three, and each one was a paid model call.
+    """
+    source = inspect.getsource(store.reserve_generation)
+    assert "async with connection.transaction():" in source
+    assert "pg_advisory_xact_lock" in source
+    # The lock has to be taken before anything is counted, or it guards nothing.
+    assert source.index("pg_advisory_xact_lock") < source.index("MAX_ACTIVE_PLANS")
+    assert source.index("pg_advisory_xact_lock") < source.index("INSERT INTO plan_generations")
+
+
+def test_the_model_call_does_not_hold_a_database_connection():
+    """A pooled connection held across generation is a connection nobody else can have.
+
+    The pool has five. Five students planning at once made the API unavailable to
+    everyone. So the route takes its own connections for the two short phases and holds
+    none across the wait.
+    """
+    source = inspect.getsource(plans_router.create_plan)
+    assert "connection: asyncpg.Connection = Depends(get_connection)" not in source, (
+        "a yielded dependency is held until the response is sent"
+    )
+    assert "Depends(current_tenant)" not in source, "that dependency holds a connection"
+    generate_at = source.index("await _generate(inventory)")
+    # Every acquire opens and closes before or after the wait, never around it.
+    before = source[:generate_at]
+    assert before.count("async with pool.acquire()") == 1
+    assert source[generate_at:].count("async with pool.acquire()") >= 1
 
 
 # --- what the batch question endpoint will and will not fetch --------------------------
@@ -353,8 +405,8 @@ def test_a_scope_with_nothing_published_is_refused_rather_than_stored():
 def test_resuming_a_plan_costs_neither_a_slot_nor_a_generation():
     source = inspect.getsource(plans_router.create_plan)
     existing_at = source.index("active_plan_for_scope")
-    limits_at = source.index("_check_limits")
-    assert existing_at < limits_at, "the resume check must come first"
+    reserve_at = source.index("reserve_generation")
+    assert existing_at < reserve_at, "the resume check must come first"
 
 
 # --- contract ---------------------------------------------------------------------------
@@ -432,3 +484,28 @@ def test_the_hourly_limit_leaves_room_to_replace_a_plan():
     """
     assert store.MAX_PLANS_PER_HOUR > store.MAX_ACTIVE_PLANS
     assert store.MAX_PLANS_PER_DAY >= store.MAX_PLANS_PER_HOUR
+
+
+def test_a_reservation_in_flight_holds_an_active_slot():
+    """The active cap has to count plans that are still being built.
+
+    The plan row is not written until after generation, so a cap that counted only
+    `study_plans` was check-then-act all over again: several requests through the lock
+    each saw the same empty list and each took a slot. Measured, before this: five plans
+    against a cap of three.
+    """
+    connection = _FakeConnection(
+        rows=[{"plan_id": "1", "scope_title": "Gravitation", "updated_at": None}],
+        values=[store.MAX_ACTIVE_PLANS - 1],  # the rest of the slots are mid-generation
+    )
+    with pytest.raises(store.LimitReached) as raised:
+        asyncio.run(store.reserve_generation(connection, "student-1", "T", "n"))
+    assert raised.value.status == 409
+
+
+def test_an_abandoned_reservation_stops_holding_a_slot():
+    """A process that dies mid-generation must not cost a student a slot for ever."""
+    source = inspect.getsource(store.reserve_generation)
+    assert "IN_FLIGHT_WINDOW" in source
+    assert "outcome = 'started'" in source
+    assert store.IN_FLIGHT_WINDOW == "5 minutes"

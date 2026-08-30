@@ -406,6 +406,34 @@ CREATE INDEX IF NOT EXISTS idx_plan_items_step ON study_plan_step_items (step_id
 -- How long a lecture runs. Without it a step cannot say "watch to 6:40" and cannot
 -- estimate honestly, so the planner has been writing duration-free guidance. Nullable
 -- and backfilled through the admin path; the inventory reads it once it is populated.
+-- Every attempt to generate a plan, whether or not one came out of it.
+--
+-- The spend limits used to be counted over `study_plans`, which had two problems. The
+-- small one: a generation that failed still cost money and left no trace, so the limit
+-- undercounted exactly when it mattered. The large one: counting rows that do not exist
+-- yet cannot be atomic — two requests both counted two, both saw room, and both paid.
+-- Six concurrent requests produced six plans against a cap of three.
+--
+-- So a row is written here *before* the model is called, under a per-student lock, and
+-- the limit is a count of these. A reservation that never becomes a plan still counts,
+-- which is the correct answer to "what has this student spent".
+CREATE TABLE IF NOT EXISTS plan_generations (
+  generation_id UUID PRIMARY KEY,
+  firebase_uid  TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
+  tenant_id     TEXT NOT NULL REFERENCES tenants(tenant_id),
+  scope_node_id TEXT NOT NULL,
+  -- Set when the attempt resolves. `started` rows that never resolve are a crash during
+  -- generation; they still count, because the call was still made.
+  outcome       TEXT NOT NULL DEFAULT 'started'
+                CHECK (outcome IN ('started', 'saved', 'failed')),
+  plan_id       UUID REFERENCES study_plans(plan_id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_generations_recent
+  ON plan_generations (firebase_uid, created_at DESC);
+
+
 -- Which round of remediation added a step. Zero for everything the planner wrote; one
 -- for the work appended after the first missed checkpoint, and so on. Stored rather than
 -- inferred because it is the only thing bounding how far a plan can grow — and because a
