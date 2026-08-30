@@ -40,6 +40,11 @@ In the service's **Environment** tab:
 | `OPENAI_API_KEY` | the project key | Only for model-written plans |
 | `JEENE_PLANNER_MODEL` | e.g. `gpt-5` | Only for model-written plans |
 | `JEENE_PLANNER_ENABLED` | `true` | Only for model-written plans |
+| `JEENE_NOTES_STORAGE_HOSTS` | *leave unset* | Only for a local fixture server |
+
+`JEENE_NOTES_STORAGE_HOSTS` is deliberately blank in production. Unset, the notes viewer
+will stream only from an `https` URL that resolves to a public address — which is stricter
+than any list, and does not go stale when storage moves.
 
 Leaving the last three unset is a **supported configuration**: every plan then comes from
 the deterministic planner, no network call is made, and nothing is billed. It is also the

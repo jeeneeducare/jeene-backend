@@ -40,6 +40,12 @@ services:
       # the worst way for it to fail.
       - key: JEENE_ASSET_SECRET
         sync: false
+      # Hosts the notes viewer may stream a PDF from, comma-separated. Leave unset in
+      # production: the default rule is https plus a globally-routable address, which is
+      # stricter than a list somebody has to remember to update. Naming hosts is for a
+      # local setup pointing at a plain-http fixture server.
+      - key: JEENE_NOTES_STORAGE_HOSTS
+        sync: false
       # Origins allowed to drive a test sitting from a browser. Explicit rather than
       # a wildcard: these endpoints accept a credential, and any site permitted here
       # could sit a paper on a student's behalf. Both Firebase Hosting domains for
