@@ -15,6 +15,13 @@
 --   psql jeene_test -f ../../jeene-plugin/db/schema.sql
 --   psql jeene_test -f db/backend_schema.sql
 --   psql jeene_test -f db/testdata/seed_plans.sql
+--
+-- Then point the suite at it. The `sslmode=disable` is not optional and not obvious:
+-- the pool defaults to requiring TLS because Supabase does, and a local server that has
+-- not been given a certificate answers with `rejected SSL upgrade` — which arrives as
+-- every single integration test failing at once, looking nothing like a config problem.
+--
+--   DATABASE_URL='postgresql://localhost:5432/jeene_test?sslmode=disable' pytest
 
 BEGIN;
 
