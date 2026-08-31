@@ -866,3 +866,24 @@ def test_a_very_long_message_is_refused_by_the_contract(client):
     # An unbounded body is an unbounded prompt, and the prompt is what costs.
     response = client.post("/plans/interpret", json={"text": "x" * 5000})
     assert response.status_code == 422
+
+
+@integration
+def test_an_exam_id_that_differs_only_in_case_still_matches(client):
+    # The seed writes exam_id 'NEET'; production writes 'neet'; the app sends 'NEET'.
+    # Whichever way round it is, the student must get their chapters.
+    upper = client.get("/chapters", params={"exam": "NEET"})
+    lower = client.get("/chapters", params={"exam": "neet"})
+    assert upper.status_code == 200 and lower.status_code == 200
+    assert upper.json(), "the seed's own casing must return chapters"
+    assert len(lower.json()) == len(upper.json()), (
+        "case must not decide whether a student has a syllabus"
+    )
+
+
+@integration
+def test_the_scope_search_honours_the_exam_filter_the_same_way(client):
+    upper = client.get("/plans/scopes", params={"q": "gravitation", "exam": "NEET"})
+    lower = client.get("/plans/scopes", params={"q": "gravitation", "exam": "neet"})
+    assert upper.status_code == 200 and lower.status_code == 200
+    assert len(lower.json()) == len(upper.json())

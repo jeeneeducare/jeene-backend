@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import os
 
 import pytest
@@ -339,3 +340,27 @@ def test_the_player_page_carries_the_id_and_a_real_origin():
     assert "https://www.youtube.com/iframe_api" in page
     assert "onError" in page
 
+
+
+# --- the exam filter -----------------------------------------------------------------
+#
+# This cost a whole home screen. The app's canonical exam value is "NEET"
+# (Onboarding.kt); the pipeline writes exam_id 'neet'. An exact match returned zero
+# chapters for every student who had chosen an exam, and the app — which substitutes
+# placeholder subject cards when it has no subjects — showed three convincing cards that
+# did nothing at all when tapped.
+
+
+def test_the_exam_filter_ignores_case_in_the_sql():
+    from app.routers import content as content_router
+
+    source = inspect.getsource(content_router.list_chapters)
+    assert "lower(e.exam_id) = lower($3)" in source, (
+        "an exam id that differs only in case is the same exam"
+    )
+
+
+def test_the_scope_search_matches_the_chapter_list_on_this():
+    from app.plans import lookup
+
+    assert "lower(e.exam_id) = lower($7)" in lookup._CANDIDATES_SQL

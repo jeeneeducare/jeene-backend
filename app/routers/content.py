@@ -52,7 +52,13 @@ async def list_chapters(
         WHERE c.tenant_id = $1 AND c.type = 'chapter' AND c.status = 'published'
           AND ($2::int IS NULL OR c.class_level = $2)
           AND ($3::text IS NULL OR EXISTS (
-                SELECT 1 FROM exams e WHERE e.exam_id = $3 AND c.subject_id = ANY(e.subjects)))
+                SELECT 1 FROM exams e
+                 -- Case-insensitive on purpose. The app's canonical value is "NEET"
+                 -- (Onboarding.kt) and the pipeline writes exam_id 'neet', so an exact
+                 -- match returned zero chapters for every student who had picked an
+                 -- exam: no subjects, a home screen of placeholder cards, and taps that
+                 -- did nothing. An id that differs only in case is the same exam.
+                 WHERE lower(e.exam_id) = lower($3) AND c.subject_id = ANY(e.subjects)))
         ORDER BY c.subject_id, c.class_level, c.ncert_chapter_number NULLS LAST, c.title
         """,
         tenant,

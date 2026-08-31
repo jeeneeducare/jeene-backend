@@ -141,7 +141,8 @@ WITH RECURSIVE candidates AS (
        AND ($6::int IS NULL OR n.class_level = $6)
        AND ($7::text IS NULL OR EXISTS (
               SELECT 1 FROM exams e
-               WHERE e.exam_id = $7 AND n.subject_id = ANY(e.subjects)))
+               -- Case-insensitive, for the reason content.py's chapter list is.
+               WHERE lower(e.exam_id) = lower($7) AND n.subject_id = ANY(e.subjects)))
        AND (
               EXISTS (SELECT 1 FROM unnest($4::text[]) AS t
                        WHERE position(t in {_NORM_TITLE}) > 0)
