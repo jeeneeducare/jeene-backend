@@ -233,13 +233,30 @@ def test_scopes_is_declared_before_the_plan_id_route():
     assert paths.index("/plans/scopes") < paths.index("/plans/{plan_id}")
 
 
-def test_the_route_requires_a_signed_in_student():
+def test_the_route_is_open_to_anonymous_callers():
+    # It backs the home search bar, and browsing works signed out. A token-gated search
+    # would be a search box that goes dead the moment a student signs out, guarding
+    # nothing: the reply is node ids, titles and counts — the same catalogue
+    # `GET /chapters` serves without a token — and says nothing about the student.
+    from app.auth import current_tenant, require_user
+
     signature = inspect.signature(plans_router.search_scopes)
     dependencies = [
         p.default.dependency
         for p in signature.parameters.values()
         if hasattr(p.default, "dependency")
     ]
-    from app.auth import require_user
+    assert require_user not in dependencies
+    # Still tenant-scoped, so an anonymous caller sees the default tenant and no other.
+    assert current_tenant in dependencies
 
-    assert require_user in dependencies
+
+def test_the_reply_carries_no_question_content():
+    # The boundary the whole feature rests on: this endpoint is now unauthenticated, so
+    # anything it returns is public. Titles and counts are; a question's text, options
+    # and answer are not, and must never be added to this shape.
+    from app.schemas import ScopeMatch
+
+    leaks = {"question", "questions", "options", "answer", "answers", "explanation",
+             "solution", "text", "body"}
+    assert leaks.isdisjoint(ScopeMatch.model_fields.keys())

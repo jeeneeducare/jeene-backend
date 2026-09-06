@@ -129,11 +129,17 @@ async def search_scopes(
     limit: int = Query(default=lookup.DEFAULT_LIMIT, ge=1, le=lookup.MAX_LIMIT),
     class_level: int | None = Query(default=None, ge=1),
     exam: str | None = Query(default=None),
-    user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[ScopeMatch]:
     """What a student could have meant, for a student who typed instead of tapping.
+
+    Open to anonymous callers, like the rest of the catalogue. It answers with node ids,
+    titles and question counts — the same syllabus `GET /chapters` hands out without a
+    token — and nothing about the student, so requiring one bought no privacy. It cost
+    something instead: this backs the home search bar, and browsing works signed out, so
+    a token-gated search would have been a search box that goes dead when you sign out.
+    `current_tenant` already resolves anonymous callers to the default tenant.
 
     Declared above `GET /{plan_id}`: FastAPI matches in declaration order, and below it
     "scopes" would be read as a plan id and 404.
