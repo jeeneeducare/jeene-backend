@@ -166,6 +166,7 @@ async def chapter_notes(
         page_count=row["page_count"],
         size_bytes=row["size_bytes"],
         viewer_url=f"{origin}/notes/{chapter_id}?t={token}",
+        file_url=f"{origin}/notes/{chapter_id}/file?t={token}",
     )
 
 

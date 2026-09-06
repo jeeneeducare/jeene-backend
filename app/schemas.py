@@ -441,6 +441,13 @@ class ChapterNotes(BaseModel):
     # deliberately not `pdf_url`: the object URL in storage is durable, unauthenticated
     # and shareable, so it does not leave the server. See `app/routers/notes.py`.
     viewer_url: str
+    # The PDF itself, streamed back through `/notes/{id}/file` under the same signature.
+    # Same reasoning as `viewer_url`: the object URL in storage never leaves the server.
+    # Both are here because the two readers want different things — the app's own page
+    # renderer wants bytes, the plan sheet drops the viewer page into a web view — and
+    # leaving this one out is what made every Notes tile in browsing say "Not written
+    # yet", including the eight chapters that have notes.
+    file_url: str = ""
     # Both nullable in the table, and so both nullable here. They were declared required,
     # which meant a published row whose size had not been recorded made the endpoint 500
     # rather than answer — found the first time a client actually called it, which was

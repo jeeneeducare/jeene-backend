@@ -7,6 +7,7 @@ These tests are that promise, written down: the metadata response must not conta
 storage URL, and a link that does work must stop working.
 """
 
+import inspect
 import os
 import time
 
@@ -14,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import assets
+from app.routers import notes as notes_router
 from app.schemas import ChapterNotes
 
 integration = pytest.mark.skipif(
@@ -368,3 +370,26 @@ def test_there_is_a_size_cap_on_what_is_relayed():
     # Both the claim and what actually arrives — a response that lies about its length is
     # exactly the one worth stopping.
     assert source.count("_MAX_BYTES") >= 2
+
+
+def test_the_notes_response_carries_the_streamed_file_link():
+    """The field whose absence made every Notes tile in browsing say "Not written yet".
+
+    Two readers consume this endpoint and they want different things: the plan sheet
+    drops `viewer_url` into a web view, and the app's own page renderer downloads bytes.
+    Only `viewer_url` was ever sent, so the browse path — which gates the tile on having
+    a file to fetch — concluded there were no notes for every chapter, including the
+    eight that have them.
+
+    Both links are signed and both point back here, so the object URL in storage still
+    never leaves the server.
+    """
+    from app.schemas import ChapterNotes
+
+    assert "file_url" in ChapterNotes.model_fields
+    assert "viewer_url" in ChapterNotes.model_fields
+
+    source = inspect.getsource(notes_router.chapter_notes)
+    assert "file_url=" in source, "the route must actually populate it"
+    # Signed, and served from this origin rather than from storage.
+    assert "/notes/{chapter_id}/file?t={token}" in source
