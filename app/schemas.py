@@ -718,3 +718,41 @@ class AdminProduct(Product):
     active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class QuoteRequest(BaseModel):
+    """Which product a student wants. Notably not how much it costs."""
+    product_id: str
+
+
+class QuoteResponse(BaseModel):
+    """A signed promise, plus what to draw on the confirm button.
+
+    The amount is repeated in the clear only so the app can render it. It is read from
+    the signed token on the way back in, never from this field.
+    """
+    quote: str
+    product_id: str
+    title: str
+    amount_paise: int
+    currency: str
+    duration_days: int
+    expires_in_seconds: int
+
+
+class OrderRequest(BaseModel):
+    quote: str
+
+
+class OrderResponse(BaseModel):
+    """Everything the checkout SDK needs, and nothing it does not.
+
+    `key_id` is the publishable half of the key pair. It is here because the SDK cannot
+    open without it; the secret never leaves the server.
+    """
+    order_id: str
+    key_id: str
+    amount_paise: int
+    currency: str
+    product_id: str
+    title: str

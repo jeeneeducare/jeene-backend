@@ -28,5 +28,23 @@ class Settings(BaseSettings):
     # is also how a local setup permits a plain-http fixture server.
     jeene_notes_storage_hosts: str | None = None
 
+    # --- Billing ---------------------------------------------------------------------
+    #: Publishable. Reaches the app with every created order — it has to, the checkout
+    #: SDK needs it — and is useless on its own.
+    razorpay_key_id: str | None = None
+    #: Server only, for ever. It authenticates API calls *and* is the HMAC key that
+    #: proves a success callback came from Razorpay, so a leak is both a way to spend
+    #: from the account and a way to forge a purchase.
+    razorpay_key_secret: str | None = None
+    #: Server only. Signs webhook bodies; set from the Razorpay dashboard when the
+    #: endpoint is registered.
+    razorpay_webhook_secret: str | None = None
+    #: Server only. Signs price quotes. Rotating it invalidates outstanding quotes,
+    #: which is harmless — they live ten minutes.
+    jeene_quote_secret: str | None = None
+    #: Set to allow real charges. Left false, the gateway is never constructed and the
+    #: money routes answer 503, so a half-configured deployment cannot take a payment.
+    jeene_billing_enabled: bool = False
+
 
 settings = Settings()
