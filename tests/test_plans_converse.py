@@ -243,3 +243,81 @@ def test_reading_a_message_retries_where_planning_does_not():
     assert openai_provider._READ_RETRIES >= 1
     assert openai_provider._MAX_RETRIES == 0, "planning must stay single-shot"
     assert "with_options(" in inspect.getsource(openai_provider.OpenAIPlannerProvider.read_json)
+
+
+# --- what a paid read costs -------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_limiter():
+    plans_router._recent_reads.clear()
+    yield
+    plans_router._recent_reads.clear()
+
+
+def test_the_free_answers_are_never_rate_limited():
+    """A greeting and an exact title cost nothing, so nothing is spent on them.
+
+    Asserted at the route rather than on the limiter, because the ordering is the whole
+    claim: the two cheap gates return before the limiter is reached.
+    """
+    source = inspect.getsource(plans_router.interpret_message)
+    greeting_at = source.index("greeting_reply")
+    exact_at = source.index('kind="scope"')
+    limiter_at = source.index("_rate_limit_reads")
+    assert greeting_at < limiter_at
+    assert exact_at < limiter_at
+
+
+def test_the_limiter_runs_only_when_a_model_is_about_to_be_called():
+    """With the planner off nothing is spent, so nothing may be refused."""
+    source = inspect.getsource(plans_router.interpret_message)
+    assert "if provider is not None:\n        _rate_limit_reads" in source
+
+
+def test_a_loop_of_messages_is_stopped_within_the_hour(fresh_limiter):
+    from fastapi import HTTPException
+
+    for _ in range(plans_router._READS_PER_HOUR):
+        plans_router._rate_limit_reads("a-student")
+
+    with pytest.raises(HTTPException) as refused:
+        plans_router._rate_limit_reads("a-student")
+    assert refused.value.status_code == 429
+    assert "few minutes" in refused.value.detail
+
+
+def test_a_patient_spender_is_stopped_for_the_day(fresh_limiter):
+    """Hourly alone leaves 24 hours' worth open. The daily window is what closes it."""
+    import time as clock
+
+    from fastapi import HTTPException
+
+    now = clock.time()
+    # Spread the day's allowance over hours already past, so only the daily cap can bite.
+    plans_router._recent_reads["a-student"] = [
+        now - 3700 - i for i in range(plans_router._READS_PER_DAY)
+    ]
+
+    with pytest.raises(HTTPException) as refused:
+        plans_router._rate_limit_reads("a-student")
+    assert refused.value.status_code == 429
+    assert "one day" in refused.value.detail
+
+
+def test_one_student_running_out_does_not_stop_another(fresh_limiter):
+    for _ in range(plans_router._READS_PER_HOUR):
+        plans_router._rate_limit_reads("noisy")
+
+    plans_router._rate_limit_reads("somebody-else")
+
+
+def test_yesterdays_messages_do_not_count_against_today(fresh_limiter):
+    import time as clock
+
+    plans_router._recent_reads["a-student"] = [
+        clock.time() - 90_000 for _ in range(plans_router._READS_PER_DAY)
+    ]
+
+    plans_router._rate_limit_reads("a-student")
+    assert len(plans_router._recent_reads["a-student"]) == 1, "the old ones are dropped"

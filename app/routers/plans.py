@@ -12,6 +12,8 @@ is a different job from reading what it produced.
 
 from __future__ import annotations
 
+import time
+from collections import defaultdict
 from functools import lru_cache
 
 import asyncpg
@@ -159,6 +161,50 @@ async def search_scopes(
     return [ScopeMatch(**row) for row in rows]
 
 
+#: Reading a typed message with a model costs a call. Most messages never reach one — a
+#: greeting is answered from a constant and an unambiguous title from SQL — so what is
+#: capped here is only the paid path.
+#:
+#: Generous for a person: a real intake conversation is three or four messages, and the
+#: whole point of the screen is that a student can say things in their own words without
+#: being rationed. Tight enough that a script left running cannot spend a night's worth of
+#: tokens, which is what this exists for.
+#:
+#: Two windows, like plan generation: the hourly one stops a loop, the daily one stops
+#: somebody patiently spending all day.
+_READS_PER_HOUR = 30
+_READS_PER_DAY = 120
+
+#: In-process and approximate, like the order limiter in `billing.py` and the handoff-code
+#: limiter in `tests.py`. Per worker rather than per deployment, and forgetful across a
+#: restart — which is the right size of defence for a caller who is already identified by
+#: a verified Firebase token and can be dealt with directly if they persist.
+_recent_reads: dict[str, list[float]] = defaultdict(list)
+
+
+def _rate_limit_reads(uid: str) -> None:
+    """Spend one of this student's paid reads, or refuse.
+
+    Called immediately before the model, never before the free paths — a student saying
+    hello, or naming a chapter the catalogue already recognises, has cost nothing and must
+    not be rationed for it.
+    """
+    now = time.time()
+    hits = [t for t in _recent_reads[uid] if now - t < 86400]
+    if sum(1 for t in hits if now - t < 3600) >= _READS_PER_HOUR:
+        raise HTTPException(
+            status_code=429,
+            detail="Give me a moment to catch up — try again in a few minutes.",
+        )
+    if len(hits) >= _READS_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail="That is a lot of planning for one day. Try again tomorrow.",
+        )
+    hits.append(now)
+    _recent_reads[uid] = hits
+
+
 @router.post("/interpret", response_model=PlanRead)
 async def interpret_message(
     body: PlanMessage,
@@ -185,6 +231,9 @@ async def interpret_message(
     Degrades rather than fails. No provider configured, or a provider that errored, and
     this falls through to the title search — so a student who typed a chapter name gets
     their plan whether or not the model is reachable.
+
+    Only the third gate is rate limited, and only when a model is actually about to be
+    called. Capping the first two would ration the answers that cost nothing.
     """
     text = (body.text or "").strip()
     if not text:
@@ -204,6 +253,8 @@ async def interpret_message(
     # to stop spending and still paying to read every message would be a switch that
     # does not do what its name says.
     provider = _planner_provider() if settings.jeene_planner_enabled else None
+    if provider is not None:
+        _rate_limit_reads(user["uid"])
     outline = await converse.load_outline(connection, tenant)
     read = await converse.read_message(provider, text, outline)
 
