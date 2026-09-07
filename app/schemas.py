@@ -756,3 +756,50 @@ class OrderResponse(BaseModel):
     currency: str
     product_id: str
     title: str
+
+
+class VerifyRequest(BaseModel):
+    """What the checkout SDK hands back on success.
+
+    Every field is the client's word for something. The signature makes the first two
+    checkable; nothing here is trusted until the gateway has been asked directly.
+    """
+    order_id: str
+    payment_id: str
+    signature: str
+
+
+class FailureRequest(BaseModel):
+    """The app reporting that checkout did not complete.
+
+    A claim, not a fact — confirmed against the gateway before anything is written, so a
+    patched client cannot mark a captured payment as failed.
+    """
+    order_id: str
+    reason: str = ""
+
+
+class ReconcileReport(BaseModel):
+    """What one sweep of the reconciler did. Read by a person, in a cron log.
+
+    Mutated in place while the sweep runs, so the counters are the model's fields rather
+    than a dict assembled at the end — there is one shape for this answer, not two.
+    """
+    examined: int
+    paid: int
+    failed: int
+    review: int
+    #: Still in flight, or the gateway could not be reached about them. Neither is a
+    #: problem: the next sweep asks again.
+    left_pending: int
+
+
+class SettlementResponse(BaseModel):
+    """Where the payment ended up, and what the student now has.
+
+    `entitlement` is included so a successful verify needs no second round trip before
+    the app can unlock what was blocked.
+    """
+    order_id: str
+    status: str
+    entitlement: EntitlementView | None = None

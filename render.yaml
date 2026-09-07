@@ -51,5 +51,60 @@ services:
       # could sit a paper on a student's behalf. Both Firebase Hosting domains for
       # the project are listed because either can serve the same deploy, and both the
       # apex and www of the custom domain because CORS matches an origin exactly.
+      # --- Billing (Razorpay) -----------------------------------------------------
+      # Ships off. With the flag unset the money routes answer 503 and say so, which is
+      # the right behaviour for a half-configured deployment: refusing to take a payment
+      # is recoverable, taking one it cannot confirm is not.
+      - key: JEENE_BILLING_ENABLED
+        sync: false
+      # Only the key id ever reaches the app. The secret authenticates our calls to
+      # Razorpay *and* is the HMAC key that proves a success callback is genuine, so it
+      # never leaves the server; the webhook secret signs webhook bodies and is a
+      # different value, issued when the webhook is registered.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      # Signs price quotes, so a client cannot name its own price. Generate once with
+      # `python3 -c "import secrets; print(secrets.token_hex(32))"`. Rotating it
+      # invalidates outstanding quotes, which is harmless — they live ten minutes.
+      - key: JEENE_QUOTE_SECRET
+        sync: false
+      # What the reconciler cron presents. Not a user credential and never sent to a
+      # client; the same value goes on the cron service below. Unset, the reconcile
+      # endpoint answers 503 rather than running unauthenticated — it can grant access.
+      - key: JEENE_RECONCILE_SECRET
+        sync: false
       - key: JEENE_WEB_ORIGINS
         value: https://jeene-ff8e3.web.app,https://jeene-ff8e3.firebaseapp.com,https://jeeneeducare.com,https://www.jeeneeducare.com,https://jeene-admin.web.app,https://jeene-admin.firebaseapp.com
+
+  # The fourth confirmation path. The other three depend on a message arriving — a
+  # success callback, a webhook, a failure report — and each has a way of not arriving.
+  # This one asks Razorpay directly about every payment still pending, which is what
+  # closes a purchase when a phone dies on the success screen or a webhook lands during a
+  # deploy.
+  #
+  # Every five minutes, because a student waiting to be let into what they just paid for
+  # is the thing being minimised. The sweep is idempotent and usually finds nothing, so a
+  # missed run costs one student a few minutes and a doubled run costs nothing at all.
+  - type: cron
+    name: jeene-billing-reconciler
+    runtime: python
+    region: singapore
+    plan: starter
+    schedule: "*/5 * * * *"
+    # Nothing to build: the job is a curl. Kept as a cron service rather than a thread
+    # inside the web service so a sweep still happens across a restart or a deploy, and
+    # so a failing sweep is visible as a failed run rather than as a quiet log line.
+    buildCommand: "true"
+    startCommand: ./scripts/reconcile.sh
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: JEENE_API_BASE
+        value: https://jeene-backend.onrender.com
+      # The same value as JEENE_RECONCILE_SECRET on the web service above.
+      - key: JEENE_RECONCILE_SECRET
+        sync: false

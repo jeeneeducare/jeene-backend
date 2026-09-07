@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     #: Set to allow real charges. Left false, the gateway is never constructed and the
     #: money routes answer 503, so a half-configured deployment cannot take a payment.
     jeene_billing_enabled: bool = False
+    #: Shared secret the reconciler cron presents. Not a user credential and never
+    #: reaches a client: the route it opens can settle payments.
+    jeene_reconcile_secret: str | None = None
 
 
 settings = Settings()

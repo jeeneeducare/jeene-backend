@@ -14,6 +14,7 @@ from app.routers import (
     auth,
     content,
     health,
+    internal,
     mistakes,
     notes,
     plans,
@@ -60,3 +61,4 @@ app.include_router(mistakes.router)
 app.include_router(plans.router)
 app.include_router(admin.router)
 app.include_router(billing.router)
+app.include_router(internal.router)

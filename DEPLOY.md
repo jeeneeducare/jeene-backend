@@ -70,3 +70,87 @@ viewer streams the file through the API rather than handing the URL to the app.
 ## Redeploys
 
 Render redeploys automatically on every push to the connected branch. No manual steps needed after the one-time setup above.
+
+## Payments (Razorpay)
+
+Nothing here is optional-with-a-fallback the way Jeene Mode is. Billing ships **off**:
+with `JEENE_BILLING_ENABLED` unset, every money route answers 503 and says so. Turn it on
+only once all four steps below are done, in this order.
+
+### 1. Apply the schema
+
+Same file, still safe to re-run:
+
+```
+psql "<the same DATABASE_URL Render uses>" -f db/backend_schema.sql
+```
+
+That adds `products`, `payments`, `entitlement_grants` and `users.pro_expires_at`. Nothing
+is dropped and no data is rewritten.
+
+### 2. Set the environment variables
+
+On the **web service**:
+
+| Key | Value | Needed? |
+| --- | --- | --- |
+| `JEENE_BILLING_ENABLED` | `true` | **Yes**, or every money route answers 503 |
+| `RAZORPAY_KEY_ID` | `rzp_test_…` while testing, `rzp_live_…` after | **Yes** |
+| `RAZORPAY_KEY_SECRET` | the matching secret | **Yes** |
+| `JEENE_QUOTE_SECRET` | 64 hex characters from `python3 -c "import secrets; print(secrets.token_hex(32))"` | **Yes** |
+| `RAZORPAY_WEBHOOK_SECRET` | issued in step 3 | **Yes**, before going live |
+| `JEENE_RECONCILE_SECRET` | another 64 hex characters | **Yes** |
+
+Start in **test mode**. A test key id and a live key id differ by one word and produce
+identical-looking behaviour right up until real money moves.
+
+On the **cron service** (`jeene-billing-reconciler`, created from the blueprint):
+`JEENE_RECONCILE_SECRET`, set to exactly the same value as on the web service.
+
+### 3. Register the webhook
+
+In the Razorpay dashboard, **Settings → Webhooks → Add New Webhook**:
+
+- URL: `https://jeene-backend.onrender.com/billing/webhook`
+- Events: `payment.captured`, `payment.failed`, `order.paid`
+- Secret: generate one, and put the same value in `RAZORPAY_WEBHOOK_SECRET` on Render.
+
+The secret is what authenticates the webhook — that endpoint takes no user token, because
+Razorpay has none to give. Until `RAZORPAY_WEBHOOK_SECRET` is set, every webhook is
+rejected as unsigned, and payments are confirmed only by the app and the reconciler.
+
+### 4. Create the products
+
+Prices live in the database, not in the app and not in Razorpay. Seed the three passes:
+
+```
+psql "<DATABASE_URL>" -f db/testdata/seed_products.sql
+```
+
+or create them from the admin panel (`POST /admin/products`). Retiring one sets
+`active = false`; a product is never deleted, because a payment row points at it and a
+receipt has to keep making sense.
+
+### How a payment is confirmed
+
+Four independent paths, because each fails in a way the others do not, and all four go
+through one idempotent mutator (`app/billing/settle.py`):
+
+1. **the app**, on the checkout SDK's success callback — signature checked, then the
+   payment fetched server-to-server, because a signature proves the callback is genuine
+   and not that money moved;
+2. **the webhook**, signed over the raw body;
+3. **a failure report** from the app, which is ignored outright if Razorpay says
+   something was captured;
+4. **the reconciler**, every five minutes, asking about everything still pending.
+
+A payment that is captured after we have already given up on it goes to
+`needs_manual_review` rather than quietly to `paid`. Watch for those:
+
+```sql
+SELECT order_id, firebase_uid, amount_paise, failure_reason, updated_at
+  FROM payments WHERE status = 'needs_manual_review' ORDER BY updated_at DESC;
+```
+
+Each one is a person deciding between granting access and refunding — by then the student
+has been told it failed and may well have paid again.

@@ -71,6 +71,16 @@ class GatewayPayment:
         """Terminal and unpaid. `created` and `authorized` are neither — still in flight."""
         return self.status in ("failed", "refunded")
 
+    @property
+    def in_flight(self) -> bool:
+        """Neither paid nor finished. Somebody may still be typing an OTP.
+
+        The reason failing a payment is never decided by elapsed time alone: an attempt in
+        this state is a student mid-purchase, and the slower their connection the longer
+        they sit here.
+        """
+        return not self.captured and not self.dead
+
 
 @runtime_checkable
 class PaymentGateway(Protocol):
