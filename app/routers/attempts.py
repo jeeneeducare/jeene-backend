@@ -2,6 +2,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import current_tenant, require_user
+from app.billing import gates
 from app.db import get_connection
 from app.figures import SOLUTION_PLACEMENTS, fetch_figures
 from app.schemas import (
@@ -32,7 +33,15 @@ async def submit_attempt(
     The client never sends whether it was right; it sends what the student chose.
     Practice asks for the solution back in the same round trip (so answering costs
     exactly one request); a test omits it and reveals only at the end.
+
+    The free daily allowance is checked before anything is read or graded — it is the
+    cheapest refusal available, and grading an answer we are about to refuse to record
+    would be work done for nobody.
     """
+    await gates.ensure_can_answer(
+        connection, user["uid"], tenant, attempt_id=body.attempt_id
+    )
+
     question = await connection.fetchrow(
         """
         SELECT question_id, question_type, correct_option_ids, explanation_json,

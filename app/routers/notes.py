@@ -34,7 +34,8 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from app import assets
 from app.config import settings
-from app.auth import current_tenant
+from app.auth import current_tenant, optional_user
+from app.billing import gates
 from app.db import get_connection
 from app.schemas import ChapterNotes
 
@@ -144,6 +145,7 @@ async def chapter_notes(
     chapter_id: str,
     request: Request,
     tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> ChapterNotes:
     """The written notes for a chapter, if there are any published.
@@ -156,7 +158,14 @@ async def chapter_notes(
     `page_count` and `size_bytes` are nullable because the columns are. They were once
     declared required here, which made a published row whose size had never been recorded
     answer 500 — for the only such row that existed.
+
+    The gate is here rather than on the viewer routes underneath. Those are opened in a
+    web view with no token, so they cannot check a person; what they check is a signed
+    link, and a signed link is only ever minted by this handler. Refusing here means the
+    reader is never handed a way in.
     """
+    await gates.ensure_chapter_open(connection, chapter_id, tenant, user, what="Notes")
+
     row = await _notes_row(connection, chapter_id, tenant)
     origin = str(request.base_url).rstrip("/")
     token = assets.sign(ASSET_KIND, chapter_id)

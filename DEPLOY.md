@@ -131,6 +131,33 @@ or create them from the admin panel (`POST /admin/products`). Retiring one sets
 `active = false`; a product is never deleted, because a payment row points at it and a
 receipt has to keep making sense.
 
+### What `JEENE_BILLING_ENABLED` actually switches on
+
+Read this before setting it to `true` in production, because it does two things at once.
+
+It turns on **selling** — the money routes stop answering 503 — and it turns on
+**locking**. Until it is set, every gate in `app/billing/gates.py` passes and the app
+behaves exactly as it does today. The moment it is set, existing students who are not Pro
+find:
+
+| | Free | Pro |
+| --- | --- | --- |
+| Practice | 20 questions a rolling day | unlimited |
+| Jeene Mode | one plan, ever (reopening it is always free) | the usual three-open cap |
+| Mock papers | locked (a sitting already under way can always be finished) | yes |
+| Notes and video lectures | the first chapter of each subject | every chapter |
+| Mistake Book, progress, the report, browsing the syllabus | always free | always free |
+
+The two are deliberately one switch. A student who meets a paywall on a deployment that
+cannot take their money has hit a dead end, and that is a worse first impression than
+anything on the other side of it.
+
+So: set the Razorpay variables, walk the test-mode matrix, ship the apps that understand
+a `402`, and only then set this. Turning it off again unlocks everything instantly —
+entitlements are untouched, so anyone who has paid keeps what they paid for.
+
+Every number above lives in one block at the top of `app/billing/gates.py`.
+
 ### How a payment is confirmed
 
 Four independent paths, because each fails in a way the others do not, and all four go

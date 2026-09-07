@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from app.auth import current_tenant, optional_user, require_user
+from app.billing import gates
 from app.db import get_connection
 from app.figures import fetch_figures
 from app.plans.resolve import difficulty_filter
@@ -184,6 +185,7 @@ async def node_videos(
     node_id: str,
     request: Request,
     tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[ChapterVideo]:
     """The lectures for one place in the tree, or the nearest thing above it.
@@ -198,6 +200,10 @@ async def node_videos(
     the first: mixing a topic's own videos with the chapter's would bury the specific one
     under the general.
     """
+    await gates.ensure_chapter_open(
+        connection, node_id, tenant, user, what="Video lectures"
+    )
+
     rows = await connection.fetch(
         """
         WITH RECURSIVE lineage AS (
@@ -232,6 +238,7 @@ async def node_video_groups(
     node_id: str,
     request: Request,
     tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[VideoGroup]:
     """Everything a student standing on this node should be offered, grouped by where it hangs.
@@ -247,6 +254,10 @@ async def node_video_groups(
     concept that has none of its own; that group comes back marked inherited so the screen
     can say where it came from rather than implying it lives here.
     """
+    await gates.ensure_chapter_open(
+        connection, node_id, tenant, user, what="Video lectures"
+    )
+
     below = await connection.fetch(
         """
         WITH RECURSIVE subtree AS (
@@ -288,7 +299,7 @@ async def node_video_groups(
         return groups
 
     # Nothing here or under it. Fall back to whatever a student would inherit.
-    above = await node_videos(node_id, request, tenant, connection)
+    above = await node_videos(node_id, request, tenant, user, connection)
     if not above:
         return []
     owner = await connection.fetchrow(
@@ -320,10 +331,11 @@ async def chapter_videos(
     chapter_id: str,
     request: Request,
     tenant: str = Depends(current_tenant),
+    user: dict | None = Depends(optional_user),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[ChapterVideo]:
     """The chapter's own lectures. Kept for the app's chapter-level tile."""
-    return await node_videos(chapter_id, request, tenant, connection)
+    return await node_videos(chapter_id, request, tenant, user, connection)
 
 
 @router.get("/chapters/{chapter_id}/history", response_model=list[QuestionHistory])

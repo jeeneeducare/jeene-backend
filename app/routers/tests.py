@@ -7,6 +7,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from app.auth import current_tenant, optional_user, require_user
+from app.billing import gates
 from app.db import get_connection
 from app.figures import ALL_PLACEMENTS, STUDENT_VISIBLE_PLACEMENTS, fetch_figures
 from app.schemas import (
@@ -171,6 +172,11 @@ async def start_session(
 
     Starting twice must not silently discard the first attempt's answers, so an
     unsubmitted, unexpired session is handed back rather than replaced.
+
+    Mock papers are Pro, but **resuming is not gated**. Checked before the lookup, access
+    would lock a student out of a paper they are in the middle of the moment their month
+    runs out — three hours of work behind a paywall, for the one student least placed to
+    understand why. So the sitting is found first, and only starting a new one asks.
     """
     test = await connection.fetchrow(
         """
@@ -196,6 +202,11 @@ async def start_session(
     if existing is not None:
         session = existing
     else:
+        await gates.ensure_pro(
+            connection, user["uid"], tenant,
+            message="Mock papers are part of Pro. Your practice, Mistake Book and "
+                    "reports stay free.",
+        )
         session_id = uuid.uuid4()
         expires = datetime.now(timezone.utc) + timedelta(minutes=test["duration_minutes"] or 180)
         # A collision is vanishingly unlikely but would hand one student another's

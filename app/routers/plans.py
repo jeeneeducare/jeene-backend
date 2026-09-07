@@ -19,6 +19,7 @@ from asyncpg.exceptions import UniqueViolationError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.auth import DEFAULT_TENANT, current_tenant, require_admin, require_user
+from app.billing import gates
 from app.config import settings
 from app.db import get_connection, get_pool
 from app.plans import converse, lookup, remediate, store
@@ -373,8 +374,10 @@ async def create_plan(
 
     Resuming is the common case and must not cost anything: a student who taps "Plan
     this" again on a topic they started last week wants their finished steps, not a fresh
-    plan that makes the work look undone. So the existing-plan check comes before both
-    limits — resuming is neither a new plan nor a spend.
+    plan that makes the work look undone. So the existing-plan check comes before every
+    limit, the free-tier one included — resuming is neither a new plan nor a spend, and
+    telling somebody their own saved work is behind a paywall is the worst version of
+    this screen.
 
     **This route manages its own connections, and does not take one from the dependency.**
     Writing a plan means calling a model, which is allowed forty-five seconds and gets two
@@ -398,6 +401,8 @@ async def create_plan(
             return await get_plan(
                 str(existing["plan_id"]), request, user, tenant, connection
             )
+
+        await gates.ensure_can_plan(connection, user["uid"], tenant)
 
         scope = await resolve_scope(connection, body.scope_node_id, tenant)
         if scope is None:

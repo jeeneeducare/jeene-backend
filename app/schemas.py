@@ -779,6 +779,21 @@ class FailureRequest(BaseModel):
     reason: str = ""
 
 
+class GateBlocked(BaseModel):
+    """The body of a `402`: what was refused, why, and what would lift it.
+
+    The wording is the server's, not each app's, so both platforms say the same thing and
+    a change of copy is a deploy rather than two releases. `used` and `limit` are set only
+    where a counter was the reason, so a sheet can say "20 of 20" instead of something
+    vaguer.
+    """
+    reason: str
+    message: str
+    tier: str
+    used: int | None = None
+    limit: int | None = None
+
+
 class ReconcileReport(BaseModel):
     """What one sweep of the reconciler did. Read by a person, in a cron log.
 
