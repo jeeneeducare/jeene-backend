@@ -443,3 +443,113 @@ ALTER TABLE study_plan_steps
   ADD COLUMN IF NOT EXISTS remediation_round INTEGER NOT NULL DEFAULT 0;
 
 ALTER TABLE node_videos ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
+
+
+-- ---------------------------------------------------------------------------
+-- Billing. Three tables and one cache column.
+--
+-- Deliberately *not* called "plans": `study_plans` already means a Jeene Mode plan, and
+-- one word meaning two things poisons every query and every conversation after it. The
+-- sellable things are products.
+-- ---------------------------------------------------------------------------
+
+-- What an admin can sell. Rows are retired, never deleted: a payment made last month
+-- still points here, and a deleted product would orphan somebody's receipt.
+CREATE TABLE IF NOT EXISTS products (
+  product_id     TEXT PRIMARY KEY,
+  tenant_id      TEXT NOT NULL REFERENCES tenants(tenant_id),
+  title          TEXT NOT NULL,
+  tier           TEXT NOT NULL DEFAULT 'pro',
+  -- Integer minor units, always. `1199.995 * 100` is 119999.49999999999 on one runtime
+  -- and 119999.5 on another, and once that is true, comparing two amounts for equality
+  -- stops being a yes-or-no question. Paise never has that problem.
+  amount_paise   BIGINT NOT NULL CHECK (amount_paise > 0),
+  currency       TEXT NOT NULL DEFAULT 'INR',
+  duration_days  INTEGER NOT NULL CHECK (duration_days > 0),
+  -- "Most Popular", "Save 16%". Decoration for the card; never read by arithmetic.
+  badge          TEXT NOT NULL DEFAULT '',
+  sort_order     INTEGER NOT NULL DEFAULT 0,
+  active         BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_products_sellable
+  ON products (tenant_id, sort_order) WHERE active;
+
+
+-- One row per attempt to pay. Keyed by Razorpay's own order id so the two systems can
+-- never disagree about which record is which.
+CREATE TABLE IF NOT EXISTS payments (
+  order_id            TEXT PRIMARY KEY,
+  firebase_uid        TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE RESTRICT,
+  tenant_id           TEXT NOT NULL REFERENCES tenants(tenant_id),
+  product_id          TEXT NOT NULL REFERENCES products(product_id),
+
+  -- Copied from the product at creation and never re-read. A price change tomorrow must
+  -- not rewrite what somebody paid yesterday, and a receipt has to still make sense when
+  -- the product it names has been retired.
+  amount_paise        BIGINT NOT NULL CHECK (amount_paise > 0),
+  currency            TEXT NOT NULL,
+  duration_days       INTEGER NOT NULL CHECK (duration_days > 0),
+
+  status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','paid','failed','needs_manual_review')),
+  razorpay_payment_id TEXT,
+  failure_reason      TEXT NOT NULL DEFAULT '',
+  -- What the gateway actually said, verbatim, for the day somebody disputes a charge.
+  gateway_payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  settled_at          TIMESTAMPTZ,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The reconciler's working set: unsettled rows, oldest first.
+CREATE INDEX IF NOT EXISTS idx_payments_pending
+  ON payments (created_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_payments_user
+  ON payments (firebase_uid, created_at DESC);
+
+-- One captured payment backs exactly one order. If a duplicate webhook ever tries to
+-- attach the same capture to a second order, the database refuses rather than the code
+-- remembering to.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_capture
+  ON payments (razorpay_payment_id) WHERE razorpay_payment_id IS NOT NULL;
+
+
+-- Why access is granted, append-only.
+--
+-- Expiry is derived by summing this table, never stored as the truth. With a single
+-- mutable expiry column, a webhook delivered twice adds thirty days twice and nobody
+-- finds out until a student writes in. Here the second write is refused by
+-- `idx_grant_per_order` below, which is the one constraint that makes all four
+-- confirmation paths safe to fire more than once.
+--
+-- A refund subtracts by inserting a negative `days` row. History is added to, never
+-- edited, so "why is this account Pro until March" is always answerable.
+CREATE TABLE IF NOT EXISTS entitlement_grants (
+  grant_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  firebase_uid  TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
+  tenant_id     TEXT NOT NULL REFERENCES tenants(tenant_id),
+  tier          TEXT NOT NULL DEFAULT 'pro',
+  days          INTEGER NOT NULL,
+  -- 'razorpay' today; 'apple' or 'manual' later without a migration. This column is the
+  -- seam that keeps a change of store from becoming a redesign of entitlements.
+  provider      TEXT NOT NULL,
+  -- Null for a comp or a support grant; set for anything paid.
+  order_id      TEXT REFERENCES payments(order_id),
+  note          TEXT NOT NULL DEFAULT '',
+  granted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grant_per_order
+  ON entitlement_grants (order_id) WHERE order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_grants_user
+  ON entitlement_grants (firebase_uid, tenant_id, tier);
+
+
+-- A cache of the sum above, written inside the same transaction as the grant. The ledger
+-- stays the truth; this exists so the gate on a practice request is one indexed read
+-- rather than an aggregate. Null means "never had access".
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_expires_at TIMESTAMPTZ;

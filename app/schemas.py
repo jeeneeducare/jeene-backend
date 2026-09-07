@@ -679,3 +679,42 @@ class CheckpointResult(BaseModel):
     # Filled by JM-10. A miss appends work on the concepts that were missed rather than
     # failing the plan; until then this is always empty and the step simply stays open.
     added_steps: list[PlanStep] = []
+
+
+# --- Billing ------------------------------------------------------------------------
+
+class Product(BaseModel):
+    """One thing a student can buy.
+
+    `amount_paise` is what the app formats and what the server charges; there is no
+    float anywhere in this path. The app is told the price so it can draw a card, and is
+    never trusted to send one back.
+    """
+    product_id: str
+    title: str
+    tier: str
+    amount_paise: int
+    currency: str
+    duration_days: int
+    badge: str = ""
+    sort_order: int = 0
+
+
+class EntitlementView(BaseModel):
+    """What the app needs to decide whether to draw a lock.
+
+    `expires_at` is null for a student who has never subscribed. `active` is computed
+    server-side rather than left to the client to derive from the date, so a device with
+    a wrong clock cannot unlock anything.
+    """
+    tier: str
+    active: bool
+    expires_at: datetime | None = None
+    days_remaining: int = 0
+
+
+class AdminProduct(Product):
+    """The admin view: everything the student sees, plus whether it is still sellable."""
+    active: bool
+    created_at: datetime
+    updated_at: datetime

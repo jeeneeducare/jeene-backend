@@ -27,7 +27,7 @@ from pydantic import BaseModel
 
 from app.db import get_connection
 from app.auth import require_admin
-from app.schemas import AdminNode, AdminVideo, ChapterSummary
+from app.schemas import AdminNode, AdminProduct, AdminVideo, ChapterSummary
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -292,3 +292,125 @@ async def detach(
     if removed.endswith("0"):
         raise HTTPException(status_code=404, detail="No such video here")
     return {"removed": True}
+
+
+# ---------------------------------------------------------------------------
+# Products: what the app is allowed to sell.
+# ---------------------------------------------------------------------------
+
+class ProductWrite(BaseModel):
+    """Creating or amending a product.
+
+    `amount_paise` is an integer and the API accepts nothing else. A rupee field would
+    invite a float somewhere between here and the charge, and the first time that
+    rounding went the wrong way it would be somebody's money.
+    """
+
+    product_id: str
+    title: str
+    amount_paise: int
+    duration_days: int
+    tier: str = "pro"
+    currency: str = "INR"
+    badge: str = ""
+    sort_order: int = 0
+    active: bool = True
+
+
+@router.get("/products", response_model=list[AdminProduct])
+async def list_all_products(
+    admin: dict = Depends(require_admin),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> list[AdminProduct]:
+    """Every product, retired ones included — the panel has to be able to bring one back."""
+    rows = await connection.fetch(
+        """
+        SELECT product_id, title, tier, amount_paise, currency, duration_days,
+               badge, sort_order, active, created_at, updated_at
+          FROM products WHERE tenant_id = $1
+         ORDER BY sort_order, amount_paise
+        """,
+        admin["tenant_id"],
+    )
+    return [AdminProduct(**dict(row)) for row in rows]
+
+
+@router.post("/products", response_model=AdminProduct)
+async def upsert_product(
+    body: ProductWrite,
+    admin: dict = Depends(require_admin),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> AdminProduct:
+    """Create a product, or amend one that exists.
+
+    Two rules the panel cannot be trusted to keep, so they are kept here:
+
+    A price must be positive and a duration must be at least a day. The database says so
+    too, in a CHECK constraint; this exists to answer with a sentence rather than a 500.
+
+    **Amending a price never touches money already taken.** `payments` copies the amount
+    and the duration at creation, so changing a product repriced tomorrow's purchases and
+    nothing else. That is the whole reason those columns are duplicated there.
+    """
+    if body.amount_paise <= 0:
+        raise HTTPException(status_code=400, detail="A price has to be more than nothing")
+    if body.duration_days <= 0:
+        raise HTTPException(status_code=400, detail="A pass has to last at least a day")
+    if body.currency != "INR":
+        raise HTTPException(
+            status_code=400,
+            detail="Only INR is set up today — the gateway account is Indian",
+        )
+
+    row = await connection.fetchrow(
+        """
+        INSERT INTO products (product_id, tenant_id, title, tier, amount_paise, currency,
+                              duration_days, badge, sort_order, active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (product_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            tier = EXCLUDED.tier,
+            amount_paise = EXCLUDED.amount_paise,
+            currency = EXCLUDED.currency,
+            duration_days = EXCLUDED.duration_days,
+            badge = EXCLUDED.badge,
+            sort_order = EXCLUDED.sort_order,
+            active = EXCLUDED.active,
+            updated_at = now()
+          WHERE products.tenant_id = EXCLUDED.tenant_id
+        RETURNING product_id, title, tier, amount_paise, currency, duration_days,
+                  badge, sort_order, active, created_at, updated_at
+        """,
+        body.product_id, admin["tenant_id"], body.title, body.tier, body.amount_paise,
+        body.currency, body.duration_days, body.badge, body.sort_order, body.active,
+    )
+    if row is None:
+        # The ON CONFLICT clause refused because the id belongs to another tenant.
+        raise HTTPException(status_code=409, detail="That product id is taken")
+    return AdminProduct(**dict(row))
+
+
+@router.delete("/products/{product_id}", response_model=AdminProduct)
+async def retire_product(
+    product_id: str,
+    admin: dict = Depends(require_admin),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> AdminProduct:
+    """Stop selling something. Deliberately not a delete.
+
+    Payments reference products forever, and a receipt whose product has vanished is a
+    receipt nobody can explain to the person who paid. Retiring hides it from the paywall
+    and leaves every past purchase intact and legible.
+    """
+    row = await connection.fetchrow(
+        """
+        UPDATE products SET active = FALSE, updated_at = now()
+         WHERE product_id = $1 AND tenant_id = $2
+        RETURNING product_id, title, tier, amount_paise, currency, duration_days,
+                  badge, sort_order, active, created_at, updated_at
+        """,
+        product_id, admin["tenant_id"],
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such product")
+    return AdminProduct(**dict(row))
