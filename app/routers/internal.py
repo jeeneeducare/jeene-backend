@@ -19,13 +19,13 @@ sweep unauthenticated, because this endpoint can grant access.
 from __future__ import annotations
 
 import logging
-import secrets
 import time
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app.billing import BillingUnavailable, gateway, settle
+from app.billing.gateway import constant_time_equals
 from app.config import settings
 from app.db import get_connection
 from app.schemas import ReconcileReport
@@ -66,7 +66,7 @@ def _authorise(presented: str) -> None:
     if not expected:
         logger.error("reconcile called but JEENE_RECONCILE_SECRET is not set")
         raise HTTPException(status_code=503, detail="unavailable")
-    if not presented or not secrets.compare_digest(presented, expected):
+    if not presented or not constant_time_equals(presented, expected):
         raise HTTPException(status_code=403, detail="forbidden")
 
 

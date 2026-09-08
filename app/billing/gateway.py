@@ -120,4 +120,16 @@ def hmac_sha256_hex(secret: str, message: bytes) -> str:
 
 
 def constant_time_equals(a: str, b: str) -> bool:
-    return hmac.compare_digest(a, b)
+    """Constant-time string equality that cannot be made to raise.
+
+    Encoded first, and that is not tidiness. `hmac.compare_digest` refuses two *strings*
+    containing anything outside ASCII and raises `TypeError` — so one accented character
+    in a signature header turned a 400 into a 500 on every route that checks one,
+    including the webhook, which has no authentication in front of it and which Razorpay
+    answers a 5xx by sending again.
+
+    UTF-8 rather than ASCII-with-errors, so a comparison never silently succeeds on a
+    mangled input either.
+    """
+    return hmac.compare_digest(a.encode("utf-8", "surrogatepass"),
+                               b.encode("utf-8", "surrogatepass"))

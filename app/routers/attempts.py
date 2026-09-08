@@ -34,6 +34,12 @@ async def submit_attempt(
     Practice asks for the solution back in the same round trip (so answering costs
     exactly one request); a test omits it and reveals only at the end.
 
+    **One attempt id, one question, one student.** The id is the client's, and it is what
+    makes a retry idempotent — but the reply carries the answer, so an id that is already
+    against a different question is refused rather than served. Without that check a
+    single reused id read out the whole question bank while the daily allowance sat at
+    zero, because nothing was ever written for it to count.
+
     The free daily allowance is checked before anything is read or graded — it is the
     cheapest refusal available, and grading an answer we are about to refuse to record
     would be work done for nobody.
@@ -77,8 +83,26 @@ async def submit_attempt(
         body.time_spent_ms,
         body.include_solution,
     )
-    # No row back means this attempt_id was already stored: a retry, not a new answer.
+    # No row back means this attempt_id was already stored. That is *usually* a retry —
+    # but "usually" is not good enough here, because the reply below contains the answer.
+    #
+    # An id that already belongs to a different question, or to a different student, is
+    # not a retry: it is one id being reused to read answers without ever recording one.
+    # Nothing would be written, the daily allowance would never move, and the free tier
+    # would be twenty questions only for clients that chose to play along.
     already_recorded = row is None
+    if already_recorded:
+        stored = await connection.fetchrow(
+            "SELECT firebase_uid, question_id FROM attempts WHERE attempt_id = $1::uuid",
+            body.attempt_id,
+        )
+        if stored is None or (stored["firebase_uid"], stored["question_id"]) != (
+            user["uid"], body.question_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="That answer id has already been used for something else.",
+            )
 
     # Gated on exactly the same flag as the solution text, so this can never become a
     # second, looser door to the answer.

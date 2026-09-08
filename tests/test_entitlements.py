@@ -279,3 +279,91 @@ def test_days_remaining_is_what_the_app_prints():
         assert held.days_remaining == 11, "floored, so it never promises a day that is going"
 
     in_tx(body)
+
+
+# --- two payments landing together -------------------------------------------------
+
+
+def test_two_purchases_settling_at_once_are_both_counted():
+    """The bug this file's locking exists for, and it was silent.
+
+    Two payments by one student settle against two *different* `payments` rows, so the
+    row lock in `settle` does not serialise them against each other. Without a lock on
+    the student, both folded a ledger that did not yet contain the other's grant and the
+    second write landed on top of the first: the ledger said sixty days, the cache said
+    thirty, and every gate reads the cache.
+
+    Real connections and real transactions, because the failure is a race and an
+    in-transaction fake cannot have one.
+    """
+    async def go():
+        setup = await asyncpg.connect(os.environ["DATABASE_URL"])
+        uid = f"test-{uuid.uuid4()}"
+        try:
+            await setup.execute(
+                "INSERT INTO users (firebase_uid, tenant_id) VALUES ($1, $2)", uid, TENANT
+            )
+
+            async def one(days: int):
+                conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+                try:
+                    async with conn.transaction():
+                        await entitlements.grant(
+                            conn, uid=uid, tenant=TENANT, days=days, provider="test"
+                        )
+                finally:
+                    await conn.close()
+
+            await asyncio.gather(one(30), one(30))
+
+            cached = await setup.fetchval(
+                "SELECT pro_expires_at FROM users WHERE firebase_uid = $1", uid
+            )
+            folded = await entitlements.recompute(setup, uid, TENANT)
+            assert cached == folded, "the cache every gate reads must match the ledger"
+            assert (folded - datetime.now(timezone.utc)).days >= 59, "sixty days, not thirty"
+        finally:
+            await setup.execute("DELETE FROM entitlement_grants WHERE firebase_uid = $1", uid)
+            await setup.execute("DELETE FROM users WHERE firebase_uid = $1", uid)
+            await setup.close()
+
+    asyncio.run(go())
+
+
+def test_a_free_student_costs_one_query_to_check():
+    """Not a micro-optimisation: this runs on every gated request for every free student.
+
+    A null cache means both "never subscribed" and "predates the column", so it cannot be
+    filled in for somebody with no grants — which left the fold running for ever on the
+    commonest path in the app. Asking for both facts at once settles it in one round trip.
+    """
+    class Counting:
+        """The real connection, plus a tally. asyncpg's own methods cannot be replaced."""
+
+        def __init__(self, real):
+            self._real = real
+            self.statements: list[str] = []
+
+        def __getattr__(self, name):
+            attribute = getattr(self._real, name)
+            if name not in ("fetch", "fetchrow", "fetchval", "execute"):
+                return attribute
+
+            async def counted(statement, *args, **kwargs):
+                self.statements.append(" ".join(statement.split())[:60])
+                return await attribute(statement, *args, **kwargs)
+
+            return counted
+
+    async def body(conn):
+        uid = await _student(conn)
+        watched = Counting(conn)
+
+        held = await entitlements.entitlement_of(watched, uid, TENANT)
+
+        assert held.active is False
+        assert len(watched.statements) == 1, (
+            f"one statement, not {len(watched.statements)}: {watched.statements}"
+        )
+
+    in_tx(body)

@@ -98,6 +98,10 @@ async def refresh_cache(
 
     Returns the value written, so a caller that has just granted access can answer the
     student without a second round trip.
+
+    Assumes the caller already holds the student's row — [grant] takes it. Reading the
+    ledger and writing the number derived from it is not safe against a concurrent grant
+    without that lock; see the note there.
     """
     expires_at = await recompute(connection, uid, tenant, tier)
     await connection.execute(
@@ -115,16 +119,36 @@ async def entitlement_of(
     The fallback is not paranoia about the cache drifting — it cannot, being written in
     the same transaction as every grant. It is for the rows that predate this column,
     which have a null there and a perfectly good ledger underneath.
-    """
-    cached = await connection.fetchval(
-        "SELECT pro_expires_at FROM users WHERE firebase_uid = $1", uid
-    )
-    if cached is not None:
-        return Entitlement(tier=tier, expires_at=cached)
 
+    One query for the overwhelmingly common case, which is a student who has never bought
+    anything. A null cache is ambiguous on its own — it means both "never subscribed" and
+    "predates the column" — so the existence of any grant is asked for in the same
+    statement. Without that this ran the fold on every gated request for every free
+    student, for ever, because there is nothing to write back that would stop it.
+    """
+    row = await connection.fetchrow(
+        """
+        SELECT u.pro_expires_at,
+               EXISTS (
+                   SELECT 1 FROM entitlement_grants g
+                    WHERE g.firebase_uid = u.firebase_uid
+                      AND g.tenant_id = $2 AND g.tier = $3
+               ) AS has_grants
+          FROM users u
+         WHERE u.firebase_uid = $1
+        """,
+        uid, tenant, tier,
+    )
+    if row is None or (row["pro_expires_at"] is None and not row["has_grants"]):
+        # No such user, or a student with nothing in the ledger. Either way, no access.
+        return Entitlement(tier=tier, expires_at=None)
+
+    if row["pro_expires_at"] is not None:
+        return Entitlement(tier=tier, expires_at=row["pro_expires_at"])
+
+    # Grants but no cache: a row that predates the column. Filled in once.
     computed = await recompute(connection, uid, tenant, tier)
     if computed is not None:
-        # Fill it in, so this path is taken once per user at most.
         await connection.execute(
             "UPDATE users SET pro_expires_at = $2 WHERE firebase_uid = $1", uid, computed
         )
@@ -152,7 +176,23 @@ async def grant(
     Call inside a transaction with the payment row locked. The cache refresh below is
     part of that same transaction, so there is no window in which the ledger and the
     cache disagree.
+
+    **The student's row is taken first, before the insert.** Two payments by the same
+    student settle against two *different* `payments` rows, so the lock in
+    [app.billing.settle.settle] does not serialise them against each other. Left alone,
+    both would insert a grant, both would fold a ledger that did not yet contain the
+    other's, and the second write would land on top of the first — measured: two thirty-day
+    passes bought together left the cache thirty days short of the ledger, and every gate
+    reads the cache. The student would have paid twice and been given one month.
+
+    The order matters as much as the lock. Inserting first takes a `FOR KEY SHARE` on the
+    same row through the foreign key, and two transactions then trying to upgrade to
+    `FOR UPDATE` deadlock — which is what happened when this was written the other way
+    round. Take the stronger lock before anything takes the weaker one.
     """
+    await connection.fetchval(
+        "SELECT firebase_uid FROM users WHERE firebase_uid = $1 FOR UPDATE", uid
+    )
     inserted = await connection.fetchval(
         """
         INSERT INTO entitlement_grants

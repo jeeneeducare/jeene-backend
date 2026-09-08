@@ -31,6 +31,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
+from app.billing.gateway import constant_time_equals
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,11 @@ def verify(token: str, *, uid: str) -> Quote:
 
     # Constant time: a comparison that returns early leaks the digest a byte at a time,
     # and a digest is all somebody needs to mint their own price.
-    if not hmac.compare_digest(digest, _digest(payload)):
+    #
+    # Encoded, because `compare_digest` raises on two strings holding anything outside
+    # ASCII — and a quote is a client-supplied string, so one accented character in it
+    # answered 500 instead of "that price is no longer valid".
+    if not constant_time_equals(digest, _digest(payload)):
         raise QuoteInvalid("quote was not signed here")
 
     try:

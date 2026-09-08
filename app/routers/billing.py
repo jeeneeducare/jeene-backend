@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from collections import defaultdict
 
@@ -59,6 +60,11 @@ logger = logging.getLogger(__name__)
 #: authenticated user is already identified for.
 _ORDERS_PER_HOUR = 10
 _recent_orders: dict[str, list[float]] = defaultdict(list)
+
+#: A Razorpay webhook is a few kilobytes. The cap is generous by two orders of magnitude
+#: and exists only so the one unauthenticated route in this application cannot be made to
+#: hold an arbitrary amount of memory by somebody who has never signed in.
+_MAX_WEBHOOK_BYTES = 256 * 1024
 
 
 def _rate_limit_orders(uid: str) -> None:
@@ -95,6 +101,16 @@ async def _owned(connection: asyncpg.Connection, order_id: str, uid: str) -> asy
 #: back by a person in an admin panel. Kept to printable characters and one line, so what
 #: lands in the database is a sentence rather than whatever fitted in the field.
 _REASON_LIMIT = 200
+
+
+def _as_dict(value: object) -> dict:
+    """A dictionary, whatever arrived. Missing, null and wrong-typed all read as empty."""
+    return value if isinstance(value, dict) else {}
+
+
+def _receipt(uid: str) -> str:
+    """A short, unique-per-order merchant reference. Razorpay allows forty characters."""
+    return f"jn_{uid[:20]}_{secrets.token_hex(6)}"[:40]
 
 
 def _clean_reason(reason: str) -> str:
@@ -228,6 +244,21 @@ async def create_order(
     `products` again. A price change tomorrow must not rewrite what somebody paid today,
     and a retired product must still produce a legible receipt.
     """
+    # Before anything else, and before the gateway above all. `payments.firebase_uid`
+    # references `users`, so a student whose profile has never been synced would create a
+    # real order at Razorpay and *then* die on the foreign key — leaving an order nobody
+    # has a local record of, which is the one shape the reconciler cannot see. Checked
+    # here rather than caught below, because by the time the insert fails the order exists.
+    known = await connection.fetchval(
+        "SELECT 1 FROM users WHERE firebase_uid = $1", user["uid"]
+    )
+    if not known:
+        logger.warning("order refused: no profile for %s", user["uid"])
+        raise HTTPException(
+            status_code=409,
+            detail="Please sign in again before buying.",
+        )
+
     _rate_limit_orders(user["uid"])
 
     try:
@@ -273,8 +304,11 @@ async def create_order(
         order = await gw.create_order(
             amount_paise=row["amount_paise"],
             currency=row["currency"],
-            # Razorpay caps a receipt at 40 characters.
-            receipt=f"jeene_{user['uid'][:28]}",
+            # Razorpay caps a receipt at 40 characters, and treats it as the merchant's
+            # own reference — one per order. Keyed on the student alone it repeated for
+            # every purchase they made, which is useless for reconciling a statement and
+            # breaks outright on an account with "unique receipt" turned on.
+            receipt=_receipt(user["uid"]),
             notes={"firebase_uid": user["uid"], "product_id": row["product_id"],
                    "tenant_id": tenant},
         )
@@ -460,7 +494,19 @@ async def webhook(
     the two paths that can tell an abandoned checkout from a retry — the app, which knows
     the sheet was closed, and the reconciler, which waits half an hour and asks.
     """
+    # Read before authenticating, because the signature is over the body — which makes
+    # the size the one thing worth checking first. This endpoint takes no token, so
+    # anybody who can reach the internet can post to it, and `request.body()` will happily
+    # hold a gigabyte in memory before the HMAC ever gets a look at it.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_WEBHOOK_BYTES:
+        logger.warning("webhook rejected: declared %s bytes", declared)
+        raise HTTPException(status_code=413, detail="too large")
+
     raw = await request.body()
+    if len(raw) > _MAX_WEBHOOK_BYTES:
+        logger.warning("webhook rejected: %d bytes", len(raw))
+        raise HTTPException(status_code=413, detail="too large")
 
     try:
         gw = gateway()
@@ -477,15 +523,27 @@ async def webhook(
         event = json.loads(raw)
     except ValueError:
         raise HTTPException(status_code=400, detail="bad body") from None
+    if not isinstance(event, dict):
+        # Signed, so it came from Razorpay — but a 500 here is answered with a redelivery,
+        # and a redelivery of something unparseable is a loop.
+        raise HTTPException(status_code=400, detail="bad body")
 
     name = event.get("event", "")
-    payload = event.get("payload", {})
 
     # `order.paid` carries both entities; the payment one is preferred because it is the
     # only place the payment id lives, and that id is what a refund is issued against.
-    payment = payload.get("payment", {}).get("entity", {})
-    entity = payment or payload.get("order", {}).get("entity", {})
+    #
+    # Every step is defended rather than chained. A missing key gives `{}` and reads on;
+    # a key present but null would give `None` and an AttributeError, and this route
+    # answers an AttributeError with a 500, which Razorpay answers with the same webhook
+    # again, for ever.
+    payload = _as_dict(event.get("payload"))
+    payment = _as_dict(_as_dict(payload.get("payment")).get("entity"))
+    order = _as_dict(_as_dict(payload.get("order")).get("entity"))
+    entity = payment or order
     order_id = entity.get("order_id") or entity.get("id", "")
+    if not isinstance(order_id, str):
+        order_id = ""
     if not order_id:
         logger.info("webhook %s carried no order id", name)
         return {"status": "ignored"}

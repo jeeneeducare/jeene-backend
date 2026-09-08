@@ -305,3 +305,62 @@ def test_a_flood_of_orders_is_capped(client, fake, product):
     codes = [client.post("/billing/orders", json={"quote": token}).status_code
              for _ in range(billing_router._ORDERS_PER_HOUR + 2)]
     assert 429 in codes
+
+
+def test_a_student_with_no_profile_never_reaches_the_gateway(client, fake, product):
+    """The order would be real and the local row would not.
+
+    `payments.firebase_uid` references `users`, so a student whose profile has never been
+    synced used to create an order at Razorpay and *then* die on the foreign key. What is
+    left behind is an order nobody has a record of — the one shape the reconciler cannot
+    see, because it sweeps the payments table.
+    """
+    from app.auth import require_user
+    from app.main import app
+
+    token = client.post("/billing/quote", json={"product_id": product}).json()["quote"]
+    stranger = "student-who-never-signed-in"
+    app.dependency_overrides[require_user] = lambda: {"uid": stranger}
+    try:
+        # A quote for the stranger, since the one above is bound to STUDENT.
+        theirs = quotes.sign(
+            uid=stranger, product_id=product, amount_paise=19900, currency="INR",
+            duration_days=30,
+        )
+        response = client.post("/billing/orders", json={"quote": theirs})
+    finally:
+        app.dependency_overrides[require_user] = lambda: {"uid": STUDENT}
+
+    assert response.status_code == 409
+    assert fake.orders == [], "nothing was created at Razorpay"
+    assert token  # the fixture's quote is unused here; kept so the product exists
+
+
+def test_every_order_carries_its_own_receipt(client, fake, product):
+    """Razorpay treats the receipt as the merchant's reference for *one* order.
+
+    Keyed on the student alone it repeated for every purchase they ever made, which is
+    useless for reconciling a statement and fails outright on an account with unique
+    receipts enforced.
+    """
+    for _ in range(2):
+        token = client.post("/billing/quote", json={"product_id": product}).json()["quote"]
+        client.post("/billing/orders", json={"quote": token})
+
+    receipts = [o["receipt"] for o in fake.orders]
+    assert len(receipts) == 2
+    assert receipts[0] != receipts[1]
+    assert all(len(r) <= 40 for r in receipts), "Razorpay caps a receipt at forty"
+
+
+def test_a_quote_with_odd_characters_is_refused_rather_than_fatal(client, fake, product):
+    """A quote is a client-supplied string, and `compare_digest` raises on non-ASCII.
+
+    Left alone this answered 500 rather than "that price is no longer valid" — on the one
+    route that creates a real order at a payment gateway.
+    """
+    for quote in ("payload.café", "é.é", "🙂.🙂"):
+        response = client.post("/billing/orders", json={"quote": quote})
+        assert response.status_code == 400, f"{quote!r} -> {response.status_code}"
+
+    assert fake.orders == []

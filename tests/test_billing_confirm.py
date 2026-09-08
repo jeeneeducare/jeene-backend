@@ -557,3 +557,80 @@ def test_a_late_capture_after_the_reconciler_gave_up_goes_to_a_person(client, gw
     assert response.json()["status"] == "needs_manual_review"
     assert _status(order) == "needs_manual_review"
     assert _grants(order) == 0, "a person decides whether to grant or refund"
+
+
+# --- what an unauthenticated route has to survive -----------------------------------
+
+
+def test_a_giant_webhook_body_is_refused_before_it_is_read(client, gw, order):
+    """The one route in this application that takes no token.
+
+    Anybody who can reach the internet can post to it, and the signature is over the body
+    — so the body has to be read before it can be authenticated. That makes its size the
+    one thing worth checking first, or a stranger can decide how much memory this process
+    holds.
+    """
+    from app.routers import billing as billing_router
+
+    body = b"x" * (billing_router._MAX_WEBHOOK_BYTES + 1)
+    response = client.post("/billing/webhook", content=body,
+                           headers={"X-Razorpay-Signature": "anything"})
+
+    assert response.status_code == 413
+    assert _status(order) == "pending"
+
+
+def test_a_webhook_shaped_like_nothing_we_expect_does_not_loop(client, gw, order):
+    """A 500 is answered with a redelivery, and a redelivery of the same thing is a loop.
+
+    Every one of these is signed, so only Razorpay could send them — which is exactly why
+    they must not produce a 500: an unparseable body that keeps arriving every few minutes
+    for ever is worse than one that is answered once.
+    """
+    from app.billing.gateway import hmac_sha256_hex
+
+    for body in (
+        b'["not", "an", "object"]',
+        b'{"event":"payment.captured","payload":null}',
+        b'{"event":"payment.captured","payload":{"payment":null}}',
+        b'{"event":"payment.captured","payload":{"payment":{"entity":null}}}',
+        b'{"event":"payment.captured","payload":{"payment":{"entity":{"order_id":42}}}}',
+        b'{}',
+    ):
+        response = client.post(
+            "/billing/webhook", content=body,
+            headers={"X-Razorpay-Signature": hmac_sha256_hex(WEBHOOK_SECRET, body)},
+        )
+        assert response.status_code in (200, 400), f"{body!r} -> {response.status_code}"
+
+    assert _status(order) == "pending", "and none of them settled anything"
+
+
+def test_an_unusual_signature_is_refused_rather_than_fatal(client, gw, order):
+    """`hmac.compare_digest` raises on two strings holding anything outside ASCII.
+
+    One accented character in a header therefore turned every signature check in this
+    feature from a 400 into a 500 — including this route, which has no authentication in
+    front of it and which Razorpay answers a 5xx by sending the same webhook again.
+    """
+    body, _ = _webhook("payment.captured", order)
+    # Sent as bytes, because that is how it arrives. HTTP headers are latin-1 on the
+    # wire and Starlette decodes them that way, so any byte above 0x7F becomes a
+    # non-ASCII `str` long before this application sees it — no client library needed.
+    for signature in (b"\xe9" * 64, b" bad", b"se\xf1or", bytes([0x80, 0xFF])):
+        response = client.post(
+            "/billing/webhook", content=body,
+            headers={"X-Razorpay-Signature": signature},
+        )
+        assert response.status_code == 400, f"{signature!r} -> {response.status_code}"
+
+    assert _status(order) == "pending"
+
+
+def test_a_verify_signature_with_odd_characters_is_refused(client, gw, order):
+    response = client.post("/billing/verify", json={
+        "order_id": order, "payment_id": "pay_x", "signature": "café" * 8,
+    })
+
+    assert response.status_code == 400
+    assert _status(order) == "pending"

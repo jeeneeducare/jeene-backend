@@ -423,3 +423,74 @@ def test_the_mistake_book_and_the_report_stay_free(client):
     assert client.get("/progress").status_code == 200
 
     _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+
+def test_one_answer_id_cannot_be_reused_to_read_the_question_bank(client):
+    """The way round the daily cap, if an id were allowed to wander between questions.
+
+    Nothing is written for a duplicate id, so the allowance never moves — and the reply
+    to `/attempts` contains the correct options and the worked solution. A client that
+    sent one id for every question would have had the whole bank for free while the
+    counter stayed at zero.
+    """
+    as_free()
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+    questions = _sql(
+        "SELECT question_id FROM questions WHERE status = 'published' LIMIT 2")
+    if len(questions) < 2:
+        pytest.skip("needs two published questions")
+    first, second = (q["question_id"] for q in questions)
+
+    reused = str(uuid.uuid4())
+    assert client.post("/attempts", json={
+        "attempt_id": reused, "question_id": first,
+        "selected_option_ids": ["a"], "time_spent_ms": 1000,
+    }).status_code == 200
+
+    # Same id, different question. This is the whole exploit.
+    response = client.post("/attempts", json={
+        "attempt_id": reused, "question_id": second,
+        "selected_option_ids": ["a"], "time_spent_ms": 1000,
+    })
+
+    assert response.status_code == 409
+    assert "correct_option_ids" not in response.text
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+
+def test_an_answer_id_belonging_to_somebody_else_is_refused(client):
+    """The same check, from the other direction: ids are the client's to choose."""
+    as_pro()
+    _sql("DELETE FROM attempts WHERE firebase_uid = ANY($1)", [FREE, PRO])
+    question = _question_id()
+    theirs = str(uuid.uuid4())
+    _sql("""INSERT INTO attempts (attempt_id, firebase_uid, tenant_id, question_id,
+                                  is_correct)
+            VALUES ($1::uuid, $2, $3, $4, true)""", theirs, FREE, TENANT, question)
+
+    response = client.post("/attempts", json={
+        "attempt_id": theirs, "question_id": question,
+        "selected_option_ids": ["a"], "time_spent_ms": 1000,
+    })
+
+    assert response.status_code == 409
+    _sql("DELETE FROM attempts WHERE firebase_uid = ANY($1)", [FREE, PRO])
+
+
+def test_a_genuine_retry_of_the_same_answer_still_works(client):
+    """The reason the id exists at all: a dropped response must be resendable."""
+    as_free()
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+    payload = {
+        "attempt_id": str(uuid.uuid4()), "question_id": _question_id(),
+        "selected_option_ids": ["a"], "time_spent_ms": 1000,
+    }
+
+    first = client.post("/attempts", json=payload)
+    second = client.post("/attempts", json=payload)
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert second.json()["already_recorded"] is True
+    assert len(_sql("SELECT 1 FROM attempts WHERE firebase_uid = $1", FREE)) == 1
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)

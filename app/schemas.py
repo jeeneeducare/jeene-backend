@@ -722,7 +722,7 @@ class AdminProduct(Product):
 
 class QuoteRequest(BaseModel):
     """Which product a student wants. Notably not how much it costs."""
-    product_id: str
+    product_id: str = Field(max_length=64)
 
 
 class QuoteResponse(BaseModel):
@@ -741,7 +741,9 @@ class QuoteResponse(BaseModel):
 
 
 class OrderRequest(BaseModel):
-    quote: str
+    """The signed quote, handed straight back. Bounded: it is a client-supplied string on
+    the one route that creates a real order at a payment gateway."""
+    quote: str = Field(max_length=2048)
 
 
 class OrderResponse(BaseModel):
@@ -763,10 +765,14 @@ class VerifyRequest(BaseModel):
 
     Every field is the client's word for something. The signature makes the first two
     checkable; nothing here is trusted until the gateway has been asked directly.
+
+    Bounded because unbounded strings on a payment route are free memory for anybody with
+    an account. Razorpay ids are around twenty characters and the signature is a
+    sixty-four character digest; these are generous and still finite.
     """
-    order_id: str
-    payment_id: str
-    signature: str
+    order_id: str = Field(max_length=64)
+    payment_id: str = Field(max_length=64)
+    signature: str = Field(max_length=256)
 
 
 class FailureRequest(BaseModel):
@@ -774,9 +780,13 @@ class FailureRequest(BaseModel):
 
     A claim, not a fact — confirmed against the gateway before anything is written, so a
     patched client cannot mark a captured payment as failed.
+
+    `reason` is the only free text a client writes into the payments table. It is capped
+    here as well as flattened at the router, because truncating a megabyte after receiving
+    it is not the same as refusing to receive one.
     """
-    order_id: str
-    reason: str = ""
+    order_id: str = Field(max_length=64)
+    reason: str = Field(default="", max_length=500)
 
 
 class GateBlocked(BaseModel):
