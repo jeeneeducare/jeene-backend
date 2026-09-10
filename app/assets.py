@@ -26,6 +26,7 @@ import secrets
 import time
 
 from app.config import settings
+from app.security import constant_time_equals
 
 logger = logging.getLogger(__name__)
 
@@ -92,4 +93,4 @@ def verify(kind: str, ref: str, token: str) -> bool:
     if expires_at < int(time.time()):
         return False
     # Constant time: a comparison that returns early leaks the digest a byte at a time.
-    return hmac.compare_digest(digest, _digest(kind, ref, expires_at))
+    return constant_time_equals(digest, _digest(kind, ref, expires_at))

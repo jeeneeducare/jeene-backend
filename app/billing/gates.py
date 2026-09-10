@@ -137,6 +137,41 @@ async def ensure_can_answer(
         )
 
 
+async def ensure_can_reveal(connection: asyncpg.Connection, uid: str, tenant: str) -> None:
+    """The same allowance, guarding the door that shows an answer without recording one.
+
+    `/questions/{id}/answer` exists for two honest reasons: a student who taps "Show
+    solution" without choosing, and a client recovering from an attempt that did not land.
+    Both are ordinary. What is not ordinary is using it as a way round the daily limit —
+    and it was, twice, because the limit was only ever counted on the *recording* path
+    while the *reading* path was open.
+
+    So the count is the same count. Twenty answers a day means twenty answers, however
+    they are asked for; the difference between reading one and recording one is a detail
+    of how the client is written, and the product boundary must not depend on that.
+
+    No attempt id to exclude here, because nothing is being written. A student at their
+    limit cannot read a twenty-first answer, which is the whole point.
+    """
+    if not enforced() or await is_pro(connection, uid, tenant):
+        return
+
+    used = await connection.fetchval(
+        """
+        SELECT count(*) FROM attempts
+         WHERE firebase_uid = $1 AND created_at > now() - interval '1 day'
+        """,
+        uid,
+    )
+    if used >= FREE_QUESTIONS_PER_DAY:
+        raise blocked(
+            DAILY_PRACTICE_LIMIT,
+            f"You have answered your {FREE_QUESTIONS_PER_DAY} free questions for today. "
+            "Pro removes the daily limit.",
+            used=used, limit=FREE_QUESTIONS_PER_DAY,
+        )
+
+
 # --- Jeene Mode --------------------------------------------------------------------------
 
 

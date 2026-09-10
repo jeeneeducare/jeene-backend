@@ -28,6 +28,8 @@ import hmac
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from app.security import constant_time_equals
+
 
 class GatewayError(Exception):
     """The gateway could not be reached, or answered something we cannot act on.
@@ -119,17 +121,6 @@ def hmac_sha256_hex(secret: str, message: bytes) -> str:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
-def constant_time_equals(a: str, b: str) -> bool:
-    """Constant-time string equality that cannot be made to raise.
-
-    Encoded first, and that is not tidiness. `hmac.compare_digest` refuses two *strings*
-    containing anything outside ASCII and raises `TypeError` — so one accented character
-    in a signature header turned a 400 into a 500 on every route that checks one,
-    including the webhook, which has no authentication in front of it and which Razorpay
-    answers a 5xx by sending again.
-
-    UTF-8 rather than ASCII-with-errors, so a comparison never silently succeeds on a
-    mangled input either.
-    """
-    return hmac.compare_digest(a.encode("utf-8", "surrogatepass"),
-                               b.encode("utf-8", "surrogatepass"))
+# `constant_time_equals` is imported above rather than defined here. It was defined here
+# once, and then a browser sitting a test and the notes viewer each grew their own copy —
+# both with the crash it had at the time. One implementation, in `app.security`.

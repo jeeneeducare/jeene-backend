@@ -542,3 +542,43 @@ def test_browsing_the_questions_themselves_is_still_free(client):
         app.dependency_overrides[optional_user] = (
             lambda: dict(CALLER) if CALLER.get("uid") else None
         )
+
+
+def test_the_daily_limit_covers_reading_an_answer_not_only_recording_one(client):
+    """The way round the cap that survived the first fix.
+
+    `/attempts` records and was capped; `/questions/{id}/answer` reads and was not. Two
+    screens in the app fall back to the second when the first is refused — practice did,
+    and so did a Jeene Mode step — so a student at their limit simply kept going and saw
+    every answer. The limit has to be on the question, not on the bookkeeping.
+    """
+    as_free()
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+    _spend_the_allowance(FREE, gates.FREE_QUESTIONS_PER_DAY)
+
+    response = client.get(f"/questions/{_question_id()}/answer")
+
+    assert response.status_code == 402
+    body = response.json()["detail"]
+    assert body["reason"] == gates.DAILY_PRACTICE_LIMIT
+    assert "correct_option_ids" not in response.text
+
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+
+def test_reading_an_answer_inside_the_allowance_still_works(client):
+    """Showing the solution without choosing is an ordinary thing to do."""
+    as_free()
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+    assert client.get(f"/questions/{_question_id()}/answer").status_code == 200
+
+
+def test_pro_reads_answers_without_a_ceiling(client):
+    as_pro()
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", PRO)
+    _spend_the_allowance(PRO, gates.FREE_QUESTIONS_PER_DAY + 20)
+
+    assert client.get(f"/questions/{_question_id()}/answer").status_code == 200
+
+    _sql("DELETE FROM attempts WHERE firebase_uid = $1", PRO)

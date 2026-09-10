@@ -364,3 +364,42 @@ def test_the_scope_search_matches_the_chapter_list_on_this():
     from app.plans import lookup
 
     assert "lower(e.exam_id) = lower($7)" in lookup._CANDIDATES_SQL
+
+
+# --- signed links, exam tokens, and a comparison that used to fall over ---------------
+
+
+def test_a_notes_link_with_odd_characters_is_refused_rather_than_fatal():
+    """The `?t=` on a notes link is a query string: anybody can put anything in it.
+
+    `hmac.compare_digest` raises on two strings holding anything outside ASCII, so one
+    accented character turned "that link is not valid" into a 500 — on a route reachable
+    by anyone who has ever been sent a URL.
+    """
+    from app import assets
+
+    for token in ("café", "é" * 64, "🙂", "tok\udce9n"):
+        assert assets.verify("notes", "phy_11_ch7", token) is False
+
+
+def test_a_real_notes_link_still_opens():
+    from app import assets
+
+    token = assets.sign("notes", "phy_11_ch7")
+    assert assets.verify("notes", "phy_11_ch7", token) is True
+    assert assets.verify("notes", "phy_11_ch8", token) is False
+
+
+def test_an_exam_token_with_odd_characters_is_refused_rather_than_fatal():
+    """The browser sitting a paper sends its token in a header, and headers are bytes.
+
+    The same `compare_digest` crash lived here too, on four routes — including submit,
+    which is the worst possible place to answer 500: the student is at the end of a timed
+    paper with their answers in the request.
+    """
+    from app.security import constant_time_equals
+
+    for token in ("café", "é" * 43, "🙂", "tok\udce9n", " "):
+        assert constant_time_equals(token, "a-real-web-token") is False
+
+    assert constant_time_equals("a-real-web-token", "a-real-web-token") is True

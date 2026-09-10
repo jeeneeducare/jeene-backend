@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from app.auth import current_tenant, optional_user, require_user
 from app.billing import gates
 from app.db import get_connection
+from app.security import constant_time_equals
 from app.figures import ALL_PLACEMENTS, STUDENT_VISIBLE_PLACEMENTS, fetch_figures
 from app.schemas import (
     QuestionFigure,
@@ -56,7 +57,8 @@ async def _authorized_session(
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    if web_token and session["web_token"] and secrets.compare_digest(web_token, session["web_token"]):
+    if (web_token and session["web_token"]
+            and constant_time_equals(web_token, session["web_token"])):
         return session
     if user is not None and session["firebase_uid"] == user["uid"]:
         return session

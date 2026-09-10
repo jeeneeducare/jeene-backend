@@ -583,7 +583,14 @@ async def get_question_answer(
     So a session is the price of an answer. It is free, it is what the daily allowance is
     counted against, and it is the only way this endpoint can tell one student from
     another at all.
+
+    And the allowance applies here too. It was only ever counted on `/attempts`, which
+    records — so a client that read answers without recording them had no limit at all,
+    and two different screens in this app did exactly that by falling back to this route
+    when an attempt was refused. Twenty a day means twenty a day, however they are asked
+    for.
     """
+    await gates.ensure_can_reveal(connection, user["uid"], tenant)
     row = await connection.fetchrow(
         """
         SELECT q.question_id, q.correct_option_ids, q.explanation_json
