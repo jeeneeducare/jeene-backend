@@ -522,6 +522,7 @@ async def get_question(
 @router.get("/questions/{question_id}/explanation", response_model=QuestionExplanation)
 async def get_question_explanation(
     question_id: str,
+    user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> QuestionExplanation:
@@ -564,9 +565,25 @@ async def get_question_explanation(
 @router.get("/questions/{question_id}/answer", response_model=QuestionAnswer)
 async def get_question_answer(
     question_id: str,
+    user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> QuestionAnswer:
+    """The correct options and the worked solution. Signed in only.
+
+    Browsing the syllabus and reading questions is free and anonymous, on purpose: a
+    student deciding whether to make an account should be able to see what is in here.
+    The *answer* is not part of that, and this route was open.
+
+    The consequence was not subtle. The free daily allowance is counted from `attempts`,
+    which needs a token — so signing in was what switched the limit *on*, and staying
+    signed out bought unlimited practice with full solutions. Every reason to pay
+    evaporated for anybody who simply never signed in.
+
+    So a session is the price of an answer. It is free, it is what the daily allowance is
+    counted against, and it is the only way this endpoint can tell one student from
+    another at all.
+    """
     row = await connection.fetchrow(
         """
         SELECT q.question_id, q.correct_option_ids, q.explanation_json

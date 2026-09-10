@@ -494,3 +494,51 @@ def test_a_genuine_retry_of_the_same_answer_still_works(client):
     assert second.json()["already_recorded"] is True
     assert len(_sql("SELECT 1 FROM attempts WHERE firebase_uid = $1", FREE)) == 1
     _sql("DELETE FROM attempts WHERE firebase_uid = $1", FREE)
+
+
+def test_an_answer_cannot_be_read_without_signing_in(client):
+    """The hole that made the whole free tier optional.
+
+    Browsing the syllabus and reading questions is anonymous on purpose — somebody
+    deciding whether to make an account should see what is in here. The *answer* was too,
+    and the daily allowance is counted from `attempts`, which needs a token. So signing in
+    was what switched the limit on, and staying signed out bought unlimited practice with
+    full worked solutions. Every reason to pay evaporated for anyone who never signed in.
+    """
+    from app.auth import current_tenant, optional_user, require_user
+    from app.main import app
+
+    question = _question_id()
+    # A caller with no token at all, which is what `require_user` is given in production.
+    app.dependency_overrides.pop(require_user, None)
+    app.dependency_overrides[optional_user] = lambda: None
+    try:
+        answer = client.get(f"/questions/{question}/answer")
+        explanation = client.get(f"/questions/{question}/explanation")
+
+        assert answer.status_code == 401, answer.text
+        assert "correct_option_ids" not in answer.text
+        assert explanation.status_code == 401
+    finally:
+        app.dependency_overrides[require_user] = lambda: dict(CALLER)
+        app.dependency_overrides[optional_user] = (
+            lambda: dict(CALLER) if CALLER.get("uid") else None
+        )
+        app.dependency_overrides[current_tenant] = lambda: TENANT
+
+
+def test_browsing_the_questions_themselves_is_still_free(client):
+    """The half that must stay open. A locked catalogue converts nobody."""
+    from app.auth import optional_user, require_user
+    from app.main import app
+
+    app.dependency_overrides.pop(require_user, None)
+    app.dependency_overrides[optional_user] = lambda: None
+    try:
+        assert client.get("/chapters").status_code == 200
+        assert client.get(f"/questions/{_question_id()}").status_code == 200
+    finally:
+        app.dependency_overrides[require_user] = lambda: dict(CALLER)
+        app.dependency_overrides[optional_user] = (
+            lambda: dict(CALLER) if CALLER.get("uid") else None
+        )
