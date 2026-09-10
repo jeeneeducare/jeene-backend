@@ -95,9 +95,27 @@ async def reconcile(
     """
     _authorise(x_jeene_reconcile)
 
+    # Billing switched off is a *configuration*, not a fault, and answering it with an
+    # error was wrong twice over. It made the cron fail every five minutes from the moment
+    # it was created until the day billing was turned on — which teaches whoever set it up
+    # to ignore a red run on the one job whose whole purpose is to be trusted when it
+    # complains. And it broke the rollback: switching billing off is the lever to pull when
+    # something is wrong at eleven at night, and pulling it would have started an alarm
+    # storm on top of whatever was already going on.
+    #
+    # There is genuinely nothing to sweep. Nothing can be sold, so nothing can be pending.
+    if not settings.jeene_billing_enabled:
+        logger.info("reconcile: billing is switched off; nothing to sweep")
+        return ReconcileReport(status="disabled", examined=0, paid=0, failed=0,
+                               review=0, left_pending=0)
+
+    # Switched *on* with no credentials behind it is a different thing entirely: a
+    # deployment that believes it is selling and cannot confirm a payment. That still
+    # fails loudly, because somebody has to find out.
     try:
         gw = gateway()
     except BillingUnavailable as exc:
+        logger.error("reconcile: billing is enabled but has no gateway credentials")
         raise HTTPException(status_code=503, detail="Payments are not configured") from exc
 
     rows = await connection.fetch(

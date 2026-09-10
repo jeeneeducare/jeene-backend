@@ -810,6 +810,10 @@ class ReconcileReport(BaseModel):
     Mutated in place while the sweep runs, so the counters are the model's fields rather
     than a dict assembled at the end — there is one shape for this answer, not two.
     """
+    #: `swept` or `disabled`. Zero counters mean the same thing either way — nothing was
+    #: settled — but a cron log should say whether that is because there was nothing to do
+    #: or because this deployment does not sell anything.
+    status: str = "swept"
     examined: int
     paid: int
     failed: int

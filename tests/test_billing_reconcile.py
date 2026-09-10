@@ -112,6 +112,9 @@ def gw(monkeypatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "jeene_reconcile_secret", SECRET, raising=False)
+    # A deployment that actually sells. The sweep short-circuits without this, because a
+    # deployment with billing switched off has nothing that could be pending.
+    monkeypatch.setattr(settings, "jeene_billing_enabled", True, raising=False)
     stub = StubGateway()
     billing.set_gateway(stub)
     # Everything else pending in this database is aged out of the window, so each test
@@ -285,3 +288,43 @@ def test_sweeping_twice_grants_access_once(client, gw):
     assert first["paid"] == 1
     assert second["examined"] == 0, "it is no longer pending, so it is no longer swept"
     assert _grants(order) == 1
+
+
+# --- a cron that only goes red when something is wrong ---------------------------------
+
+
+def test_billing_switched_off_is_a_quiet_sweep_rather_than_a_failure(client, gw, monkeypatch):
+    """The cron runs every five minutes from the day it is created.
+
+    Answering "billing is off" with an error meant a red run every five minutes until the
+    day billing was switched on — which trains whoever set it up to ignore a failure on
+    the one job whose entire value is being believed when it complains. It also broke the
+    rollback: switching billing off is the lever for eleven at night, and pulling it would
+    have started an alarm storm on top of the actual problem.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "jeene_billing_enabled", False, raising=False)
+    response = _sweep(client)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "disabled"
+    assert body["examined"] == 0
+
+
+def test_billing_switched_on_with_no_credentials_still_fails_loudly(client, gw, monkeypatch):
+    """A deployment that believes it is selling and cannot confirm a payment.
+
+    The opposite case, and the reason the one above is not simply "never fail": somebody
+    has to find out about this one, and the cron is how.
+    """
+    from app import billing
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "jeene_billing_enabled", True, raising=False)
+    billing.set_gateway(None)
+    monkeypatch.setattr(settings, "razorpay_key_id", None, raising=False)
+    monkeypatch.setattr(settings, "razorpay_key_secret", None, raising=False)
+
+    assert _sweep(client).status_code == 503
