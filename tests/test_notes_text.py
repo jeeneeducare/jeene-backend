@@ -227,14 +227,39 @@ def test_a_document_that_is_not_a_pdf_is_refused_rather_than_raising(monkeypatch
 
 def test_an_internal_url_is_never_fetched(monkeypatch):
     """The same guard the reader uses. `pdf_url` is written by another repository, and
-    that is a fact about someone else's code rather than a property of this one."""
-    from fastapi import HTTPException
+    that is a fact about someone else's code rather than a property of this one.
+
+    What is asserted is that no request leaves the process — not how the refusal is
+    spelled. The first version of this test pinned the spelling instead, and so pinned a
+    bug: `_extract` declined by raising, which took the whole doubt request down with it.
+    """
+    def never(*a, **k):
+        raise AssertionError("a request was made for an internal URL")
+
+    monkeypatch.setattr(notes_text.httpx, "AsyncClient", never)
 
     async def body(conn):
         chapter = f"test_nt_{uuid.uuid4().hex[:8]}"
-        await _notes(conn, chapter=chapter, url="http://127.0.0.1:8000/health")
-        monkeypatch.setattr(notes_text.settings if hasattr(notes_text, "settings") else notes_text,
-                            "_unused", None, raising=False)
-        with pytest.raises(HTTPException):
-            await notes_text._extract("http://127.0.0.1:8000/health", chapter)
+        assert await notes_text._extract("http://127.0.0.1:8000/health", chapter) is None
+    in_tx(body)
+
+
+def test_a_url_storage_refuses_costs_the_notes_not_the_feature():
+    """The storage guard refuses a URL by raising a 502 at whoever asked. Nobody asked
+    for these notes — this runs while assembling material for a doubt — so a chapter with
+    one bad URL must still be answerable from its concepts and worked solutions.
+
+    Found by running a real doubt: every question about that chapter died with "That
+    document is not available", and the chapter had plenty else to answer from.
+    """
+    async def body(conn):
+        chapter = f"test_nt_{uuid.uuid4().hex[:8]}"
+        await _notes(conn, chapter=chapter, url="http://169.254.169.254/latest/meta-data")
+
+        assert await notes_text.text_for(conn, chapter, TENANT) == ""
+
+        # And not recorded as extracted, so fixing the row fixes the chapter.
+        recorded = await conn.fetchval(
+            "SELECT text_extracted_at FROM chapter_notes WHERE chapter_id = $1", chapter)
+        assert recorded is None
     in_tx(body)

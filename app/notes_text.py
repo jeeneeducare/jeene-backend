@@ -25,6 +25,7 @@ import logging
 
 import asyncpg
 import httpx
+from fastapi import HTTPException
 
 from app.storage import STORAGE_TIMEOUT, check_storage_url
 
@@ -87,7 +88,17 @@ async def text_for(
 
 async def _extract(pdf_url: str, chapter_id: str) -> str | None:
     """Fetch and parse, or None if either failed. Never raises."""
-    check_storage_url(pdf_url)
+    try:
+        check_storage_url(pdf_url)
+    except HTTPException:
+        # The guard's job is to refuse a URL, and it refuses the way a request handler
+        # wants — by raising a 502 at whoever asked. Nobody asked for these notes: this
+        # runs while assembling material for a doubt about the chapter, and a chapter
+        # whose notes URL is wrong still has concepts and worked solutions to answer
+        # from. Letting the refusal out of here turned one bad row into a dead feature
+        # for that whole chapter.
+        logger.warning("notes for %s have a URL storage will not fetch", chapter_id)
+        return None
 
     try:
         # Redirects off, for the same reason the reader has them off: a 302 from an
