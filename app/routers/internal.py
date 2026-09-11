@@ -1,6 +1,6 @@
 """The sweeps nobody triggers. Cron reaches these; no student ever does.
 
-One endpoint lives here today: the payment reconciler, the fourth and last of the
+Two endpoints live here: the payment reconciler, the fourth and last of the
 confirmation paths. The other three all depend on something arriving — a client callback,
 a webhook, a failure report — and each has a way of not arriving. A phone dies on the
 success screen. A webhook is dropped, or lands while a deploy is restarting. A student
@@ -11,9 +11,12 @@ sitting at `pending`, which makes it the path that closes a purchase when every 
 has failed, and the reason a student who paid always ends up with what they paid for
 even when the network did not cooperate.
 
+The second is Ask Jeene's health, which grants nothing and is here because it wants the
+same lock and the same caller: something watching, on a schedule, with no user.
+
 Authenticated by a shared secret in a header, not by a user token: cron has no user. A
 deployment that has not been given the secret serves 503 here rather than running the
-sweep unauthenticated, because this endpoint can grant access.
+sweep unauthenticated, because the reconciler can grant access.
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ from app.billing import BillingUnavailable, gateway, settle
 from app.billing.gateway import constant_time_equals
 from app.config import settings
 from app.db import get_connection
-from app.schemas import ReconcileReport
+from app.doubts import answer as answer_module
+from app.schemas import DoubtHealth, ReconcileReport
 
 logger = logging.getLogger(__name__)
 
@@ -198,3 +202,76 @@ async def reconcile(
             logger.error("reconcile lost the payment row for %s", order_id)
 
     return report
+
+_HEALTH_SQL = """
+SELECT
+  count(*) FILTER (WHERE role = 'student')                          AS asked,
+  count(*) FILTER (WHERE role = 'jeene' AND answered)               AS answered,
+  count(*) FILTER (WHERE role = 'jeene' AND NOT answered)           AS declined,
+  count(*) FILTER (WHERE role = 'jeene' AND reported)               AS reported,
+  count(DISTINCT firebase_uid)                                      AS students,
+  coalesce(sum(tokens_in), 0)                                       AS tokens_in,
+  coalesce(sum(tokens_out), 0)                                      AS tokens_out
+  FROM doubt_messages
+ WHERE created_at > now() - make_interval(days => $1)
+"""
+
+#: An answer the citation check threw away is recorded as declined *and* carries the
+#: refusal copy, which is how it is told apart from a refusal the model chose to make.
+_UNGROUNDED_SQL = """
+SELECT count(*) FROM doubt_messages
+ WHERE role = 'jeene' AND NOT answered AND text = $2
+   AND created_at > now() - make_interval(days => $1)
+"""
+
+_BUSIEST_SQL = """
+SELECT n.title, count(*) AS asked
+  FROM doubt_messages m
+  JOIN doubt_threads t ON t.thread_id = m.thread_id
+  JOIN nodes n ON n.node_id = t.chapter_id
+ WHERE m.role = 'student' AND m.created_at > now() - make_interval(days => $1)
+ GROUP BY n.title ORDER BY asked DESC LIMIT 5
+"""
+
+
+@router.get("/doubts/health", response_model=DoubtHealth, include_in_schema=False)
+async def doubts_health(
+    days: int = 7,
+    x_jeene_reconcile: str = Header(default=""),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> DoubtHealth:
+    """How Ask Jeene has been doing, over the last `days`.
+
+    Read-only, and behind the cron secret rather than open: what a student asked is their
+    conversation, and while nothing here returns the text of one, the shape of somebody's
+    week is not public either.
+
+    The number to watch is `refusal_rate`. Near zero means it is answering past what the
+    material supports; very high means the material is too thin to be worth asking. What
+    *must* stay at zero is `ungrounded` — those are answers thrown away for citing
+    material they were never given, and a rising count is the prompt or the material block
+    having drifted, not a student asking something awkward.
+    """
+    _authorise(x_jeene_reconcile)
+    days = max(1, min(days, 90))
+
+    row = await connection.fetchrow(_HEALTH_SQL, days)
+    ungrounded = await connection.fetchval(
+        _UNGROUNDED_SQL, days, answer_module.COULD_NOT_ANSWER
+    )
+    busiest = await connection.fetch(_BUSIEST_SQL, days)
+
+    replied = row["answered"] + row["declined"]
+    return DoubtHealth(
+        days=days,
+        asked=row["asked"],
+        answered=row["answered"],
+        declined=row["declined"],
+        refusal_rate=round(row["declined"] / replied, 3) if replied else 0.0,
+        ungrounded=ungrounded or 0,
+        reported=row["reported"],
+        students=row["students"],
+        tokens_in=row["tokens_in"],
+        tokens_out=row["tokens_out"],
+        busiest_chapters=[f"{r['title']} ({r['asked']})" for r in busiest],
+    )

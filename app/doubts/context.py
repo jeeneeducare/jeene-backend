@@ -109,6 +109,36 @@ class Material:
     #: The question the student is looking at, when they asked from one.
     focus: Solution | None = None
 
+    def citation_labels(self) -> dict[str, str]:
+        """Short references — `C1`, `Q1` — against the real ids they stand for.
+
+        The model is asked to copy one of these back, not an id. Ids in this syllabus run
+        to fifty characters of nested segments: `chem_11_ch4_vb_theory_h2_formation_
+        overlap_concept` sits beside `chem_11_ch4_vb_theory_overlap_types_overlap_signs`,
+        and asking for sixty of those transcribed exactly is asking for a slip. It got
+        one: a real answer about sigma and pi bonds was binned four times out of four
+        because the reply cited `chem_11_ch4_vb_theory_overlap_concept` — two real ids
+        conflated, a middle segment dropped.
+
+        A two-character token cannot be mis-transcribed that way, and the check it feeds
+        is unweakened: `C99` is still not a reference that was given. The real ids also
+        stop leaving the server, which is worth having on its own.
+
+        Ordered exactly as `prompt.material_text` lists them, because both derive their
+        numbering from this one function rather than agreeing by hand.
+        """
+        labels: dict[str, str] = {}
+        for index, concept in enumerate(self.concepts, start=1):
+            labels[f"C{index}"] = concept.node_id
+        number = 1
+        if self.focus is not None:
+            labels[f"Q{number}"] = self.focus.question_id
+            number += 1
+        for solution in self.solutions:
+            labels[f"Q{number}"] = solution.question_id
+            number += 1
+        return labels
+
     def concept_ids(self) -> set[str]:
         return {c.node_id for c in self.concepts}
 

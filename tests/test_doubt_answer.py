@@ -67,7 +67,7 @@ def a_reply(**over) -> DoubtAnswer:
     base = dict(
         answer="Escape speed is $v=\\sqrt{2GM/R}$, and here is why.",
         answered=True,
-        used_concept_ids=["c_escape"],
+        used_concept_ids=["C1"],
         used_question_ids=[],
         used_notes=False,
     )
@@ -95,7 +95,7 @@ def test_a_grounded_answer_is_shown_as_written():
 
 def test_the_ids_are_deduplicated_and_keep_their_order():
     outcome, _ = run(a_material(), a_reply(
-        used_concept_ids=["c_orbit", "c_escape", "c_orbit"]))
+        used_concept_ids=["C2", "C1", "C2"]))
 
     assert outcome.used_concept_ids == ["c_orbit", "c_escape"]
 
@@ -105,7 +105,7 @@ def test_the_question_the_student_asked_about_counts_as_material():
     ungrounded — and the one question Jeene is meant to explain in full would be the one
     citation that got its answer thrown away."""
     focus = Solution("q_focus", "The one on screen", "(a) yes", "a", "Because.")
-    outcome, _ = run(a_material(focus=focus), a_reply(used_question_ids=["q_focus"]))
+    outcome, _ = run(a_material(focus=focus), a_reply(used_concept_ids=[], used_question_ids=["Q1"]))
 
     assert outcome.used_question_ids == ["q_focus"]
     assert outcome.dropped_because is None
@@ -131,7 +131,7 @@ def test_an_invented_concept_id_throws_the_whole_answer_away():
     working from something other than the material, and there is no way to tell which
     sentences came from where — so none of them are shown."""
     outcome, _ = run(a_material(), a_reply(
-        used_concept_ids=["c_escape", "c_black_holes"]))
+        used_concept_ids=["C1", "C99"]))
 
     assert outcome.text == COULD_NOT_ANSWER
     assert outcome.answered is False
@@ -140,7 +140,7 @@ def test_an_invented_concept_id_throws_the_whole_answer_away():
 
 
 def test_an_invented_question_id_throws_it_away_too():
-    outcome, _ = run(a_material(), a_reply(used_question_ids=["q_from_another_chapter"]))
+    outcome, _ = run(a_material(), a_reply(used_question_ids=["Q99"]))
 
     assert outcome.text == COULD_NOT_ANSWER
     assert outcome.dropped_because == UNGROUNDED
@@ -245,7 +245,7 @@ def test_an_id_that_kept_its_brackets_is_still_the_id_it_names():
     must not also catch a model working from the material and punctuating it.
     """
     outcome, _ = run(a_material(), a_reply(
-        used_concept_ids=["[c_escape]", " c_orbit "], used_question_ids=["[q_1]"]))
+        used_concept_ids=["[C1]", " C2 "], used_question_ids=["[Q1]"]))
 
     assert outcome.dropped_because is None
     assert outcome.used_concept_ids == ["c_escape", "c_orbit"]
@@ -254,7 +254,7 @@ def test_an_id_that_kept_its_brackets_is_still_the_id_it_names():
 
 def test_brackets_do_not_make_an_invented_id_acceptable():
     """The tolerance is for punctuation, not for the thing the check is for."""
-    outcome, _ = run(a_material(), a_reply(used_concept_ids=["[c_from_nowhere]"]))
+    outcome, _ = run(a_material(), a_reply(used_concept_ids=["[C42]"]))
 
     assert outcome.dropped_because == UNGROUNDED
 
@@ -264,7 +264,7 @@ def test_an_id_filed_under_the_wrong_heading_is_moved_not_punished():
     answer was binned for it. The id was one we sent — the model only filed it wrong, and
     the penalty for filing is not the penalty for invention."""
     outcome, _ = run(a_material(), a_reply(
-        used_concept_ids=["c_escape", "q_1"], used_question_ids=[]))
+        used_concept_ids=["C1", "Q1"], used_question_ids=[]))
 
     assert outcome.dropped_because is None
     assert outcome.used_concept_ids == ["c_escape"]
@@ -275,7 +275,7 @@ def test_the_ids_still_have_to_be_ids_we_sent():
     """The tolerance above must not turn into 'any string is fine'. This is the whole
     safety property of the feature and it is one assertion away from being nothing."""
     outcome, _ = run(a_material(), a_reply(
-        used_concept_ids=["c_escape"], used_question_ids=["q_invented"]))
+        used_concept_ids=["C1"], used_question_ids=["Q42"]))
 
     assert outcome.dropped_because == UNGROUNDED
     assert outcome.text == COULD_NOT_ANSWER

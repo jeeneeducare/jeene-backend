@@ -254,18 +254,59 @@ exist for eight physics chapters and are used where present.
 
 ### 5. Watching it
 
-Two numbers say whether it is healthy, both from `doubt_messages`:
-
-```sql
--- Answers Jeene declined to give. Near zero means it is inventing; very high means the
--- material is too thin. Somewhere in between is the feature working.
-SELECT count(*) FILTER (WHERE NOT answered)::float / count(*) AS refusal_rate
-  FROM doubt_messages WHERE role = 'jeene' AND created_at > now() - interval '7 days';
-
--- Answers a student marked wrong. The best bug reports this feature will get.
-SELECT message_id, left(text, 120) FROM doubt_messages WHERE reported ORDER BY created_at DESC;
+```bash
+curl -H "X-Jeene-Reconcile: $JEENE_RECONCILE_SECRET" \
+  "https://jeene-backend.onrender.com/internal/doubts/health?days=7"
 ```
 
-An answer dropped for citing material it was never given is logged as
-`doubt answer dropped reason=cited material it was not given`, with the offending ids and
-never the text. A rising count there means the prompt or the material block has drifted.
+Behind the cron secret, the same one the reconciler uses, and read-only. Nothing it
+returns is the text of anybody's question, but the shape of a student's week is not public
+either.
+
+Two numbers matter, and they are different in kind.
+
+**`refusal_rate`** is a signal. Near zero means Jeene is answering past what the material
+supports — inventing. Very high means the material is too thin to be worth asking. The
+evaluation set sits at 50% by construction, because half its cases are things that must be
+refused; real traffic should land well below that.
+
+**`ungrounded`** is a bug. It counts answers thrown away for citing material they were
+never given, and it should read zero. A rising count is the prompt or the material block
+having drifted, not a student asking something awkward. Each one is logged as
+`doubt answer dropped reason=cited material it was not given` with the offending
+references and never the text.
+
+`reported` is students tapping "this was wrong", which is the best bug report this feature
+will get — an answer is assembled from one student's material at one moment, and without
+that tap nobody would ever learn which ones were bad. Read them:
+
+```sql
+SELECT message_id, left(text, 200) FROM doubt_messages
+ WHERE reported ORDER BY created_at DESC;
+```
+
+### 6. The evaluation set
+
+```bash
+DATABASE_URL="<production, read-only>" JEENE_DOUBTS_MODEL=gpt-5-mini \
+  .venv/bin/python evals/doubts/run.py
+```
+
+Twelve labelled doubts against real chapter material in all three subjects — six it must
+answer, six it must refuse, including a request for the answer key, a jailbreak and a
+message from a student in distress. It reports grounding, whether it answered and refused
+the right things, whether the maths will render, and what an answer costs.
+
+It costs about ₹2.50 a run and reads production without writing to it. Run it after any
+change to the prompt, the schema, or the material block — all three are places where an
+edit that reads better can quietly make answers worse, and nothing else will tell you.
+
+Three consecutive runs on `gpt-5-mini`: 12/12 grounded, 12/12 correctly answered or
+refused, 12/12 renderable, every time. ₹0.19 an answer cold, ₹0.08 once the provider's
+prefix cache is warm — so ₹24 a month for a student who uses all ten every day, which
+almost nobody will. Latency 3.6–15s, with an occasional long one past thirty; the client
+waits sixty before giving up.
+
+The figures above are also the reason the model is `gpt-5-mini` rather than `gpt-5`: on
+the same cases `gpt-5` cost eight times as much and took roughly twice as long, at quality
+this set could not tell apart.

@@ -47,14 +47,43 @@ def a_material(**over) -> Material:
 # --- what is there --------------------------------------------------------------------
 
 
-def test_every_item_carries_the_id_the_model_has_to_copy_back():
-    """`used_concept_ids` is checked against what was sent, so an id the model had to
-    reconstruct from a title is an id it will get wrong — and a correct answer would then
-    be thrown away for citing something it was looking straight at."""
+def test_every_item_carries_the_short_reference_the_model_copies_back():
+    """`C1`, `Q1` — not the real id.
+
+    The ids in this syllabus run to fifty characters of nested segments, and a real
+    answer about sigma and pi bonds was binned four runs out of four because the reply
+    cited `chem_11_ch4_vb_theory_overlap_concept`: two real ids conflated, one middle
+    segment dropped. A two-character reference cannot be mis-transcribed that way.
+    """
     text = material_text(a_material())
 
-    assert "[c_escape]" in text
-    assert "[q_worked]" in text
+    assert "[C1] Escape Speed" in text
+    assert "[Q1]" in text
+
+
+def test_the_real_ids_are_never_sent_to_the_provider():
+    """Falls out of the references and is worth keeping on purpose: what the model is
+    given is a chapter's teaching material, not this app's internal identifiers."""
+    material = a_material(focus=WORKED, recent=[
+        Attempt("q_worked", "Which of these is the escape speed?", was_correct=False),
+    ])
+    text = material_text(material)
+
+    for real_id in ("c_escape", "q_worked"):
+        assert real_id not in text, f"{real_id} reached the prompt"
+
+
+def test_the_references_mean_what_the_checker_thinks_they_mean():
+    """Both sides derive their numbering from `citation_labels`, so this pins that they
+    are in fact the same numbering — a block that said `C2` where the checker read `C3`
+    would silently credit an answer to the wrong concept."""
+    material = a_material(
+        concepts=[Concept("c_a", "First", "one"), Concept("c_b", "Second", "two")])
+    text = material_text(material)
+    labels = material.citation_labels()
+
+    assert labels["C1"] == "c_a" and labels["C2"] == "c_b"
+    assert "[C1] First" in text and "[C2] Second" in text
 
 
 def test_the_chapter_and_what_they_are_looking_at_are_both_named():
@@ -117,7 +146,8 @@ def test_the_focus_answer_does_not_leak_into_the_worked_examples():
     text = material_text(a_material(focus=WORKED, solutions=[other]))
 
     assert text.count("Correct answer") == 1
-    assert "[q_other]" in text
+    # The focus takes Q1, so the worked example beside it is Q2 — and is still listed.
+    assert "[Q2] Another one" in text
 
 
 # --- the prompt itself -------------------------------------------------------------------

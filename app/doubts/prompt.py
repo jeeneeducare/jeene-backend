@@ -22,7 +22,7 @@ from __future__ import annotations
 from app.doubts.context import Material
 
 # Bump when SYSTEM changes in a way that would produce different answers.
-PROMPT_VERSION = 1
+PROMPT_VERSION = 3
 
 #: How much of the conversation goes back with the next question. A doubt thread runs for
 #: a whole chapter, so it cannot all go; six turns is enough to keep "why?" meaning what
@@ -57,10 +57,15 @@ This is not caution for its own sake. Your answer appears inside the app, beside
 teacher wrote, and a student reads it as the app's own words. An answer that has quietly
 mixed in something you remember cannot be told apart from one that has not.
 
-If the material does not settle the question, say so. Set `answered` to false, tell the
-student plainly which part you cannot answer from what this chapter holds, and then teach
-whatever part of it you can. A short honest answer is worth more than a confident
-invented one, and a student who is told to check with their teacher has lost nothing.
+If the material does not settle the question, say so. Tell the student plainly which part
+you cannot answer from what this chapter holds, and then teach whatever part of it you
+can. A short honest answer is worth more than a confident invented one, and a student who
+is told to check with their teacher has lost nothing.
+
+Set `answered` to false only when the material let you answer *none* of it. Answering most
+of a question and naming the gap is answering it — the app marks a false one "not covered
+by this chapter", and putting that label on a good partial answer tells a student to go
+and look elsewhere for something they have just been given.
 
 # How to teach
 
@@ -95,11 +100,11 @@ $v = \\sqrt{2GM/R}$.
    worked examples are there for you to teach from, and the student is about to practise
    those very questions. The one question they asked about, if there is one, is theirs to
    have explained in full — that one you may answer completely.
-2. Report honestly what you used. `used_concept_ids` and `used_question_ids` must hold
-   the ids of the material you actually drew on, copied from the material block without
-   the square brackets around them — write `phy_11_ch8_hooke_law_statement`, not
-   `[phy_11_ch8_hooke_law_statement]`. Never write an id that was not given to you. If
-   you used the chapter notes, set `used_notes` to true.
+2. Report honestly what you used. Every item in the material carries a short reference in
+   square brackets — `[C4]`, `[Q2]`. Put the references of the things you actually drew
+   on in `used_concept_ids` and `used_question_ids`, written without the brackets: `C4`,
+   not `[C4]`. Use only references that appear in the material; never invent one. If you
+   used the chapter notes, set `used_notes` to true.
 3. Answer only doubts about what this student is studying. For anything else — a
    different subject, the app itself, personal matters, ordinary chat — set `answered` to
    false and say that you can only help with the chapter they are on.
@@ -112,9 +117,11 @@ $v = \\sqrt{2GM/R}$.
 def material_text(material: Material) -> str:
     """The material block: everything the model may quote, laid out to be quoted from.
 
-    Ids are written in square brackets against each item because the model has to copy
-    them back exactly — `used_concept_ids` is checked against what was sent, and an id it
-    had to reconstruct from a title is an id it will get wrong.
+    Each item carries a short reference — `[C1]`, `[Q1]` — rather than its real id, and
+    that is the reference the model copies back. See `Material.citation_labels`: the ids
+    in this syllabus are fifty characters of nested segments, and asking for sixty of them
+    transcribed exactly cost a real answer four times out of four. The real ids never go
+    to the provider at all now, which is worth having quite apart from the accuracy.
 
     One deliberate omission: the correct option of a worked example is not here. Rule 1
     tells the model not to reveal it, and this makes the rule enforceable rather than
@@ -122,6 +129,8 @@ def material_text(material: Material) -> str:
     it is the entire teaching value, and the question the student actually asked about
     keeps its answer, because explaining that one is the point.
     """
+    label_of = {node_id: label for label, node_id in material.citation_labels().items()}
+
     out: list[str] = [
         f"CHAPTER: {material.anchor.chapter_title}",
         f"THE STUDENT IS LOOKING AT: {material.anchor.scope_title}",
@@ -132,7 +141,7 @@ def material_text(material: Material) -> str:
         out += [
             "",
             "THE QUESTION THEY ARE LOOKING AT — explain this one fully:",
-            f"[{f.question_id}] {f.stem}",
+            f"[{label_of[f.question_id]}] {f.stem}",
         ]
         if f.options:
             out.append(f"Options: {f.options}")
@@ -144,8 +153,8 @@ def material_text(material: Material) -> str:
     if material.concepts:
         out += ["", "CONCEPTS IN THIS CHAPTER:"]
         out += [
-            f"[{c.node_id}] {c.title} — {c.description}" if c.description
-            else f"[{c.node_id}] {c.title}"
+            f"[{label_of[c.node_id]}] {c.title} — {c.description}" if c.description
+            else f"[{label_of[c.node_id]}] {c.title}"
             for c in material.concepts
         ]
 
@@ -156,7 +165,7 @@ def material_text(material: Material) -> str:
             "any of them:",
         ]
         for s in material.solutions:
-            out.append(f"[{s.question_id}] {s.stem}")
+            out.append(f"[{label_of[s.question_id]}] {s.stem}")
             if s.explanation:
                 out.append(f"Worked solution: {s.explanation}")
 
@@ -166,8 +175,7 @@ def material_text(material: Material) -> str:
     if material.recent:
         out += ["", "WHAT THIS STUDENT RECENTLY ANSWERED IN THIS CHAPTER:"]
         out += [
-            f"[{a.question_id}] {a.stem} — "
-            f"{'got it right' if a.was_correct else 'got it wrong'}"
+            f"{a.stem} — {'got it right' if a.was_correct else 'got it wrong'}"
             for a in material.recent
         ]
 

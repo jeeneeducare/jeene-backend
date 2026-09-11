@@ -462,3 +462,55 @@ def test_reporting_something_that_does_not_exist_is_missing(client):
     assert client.post(
         f"/doubts/messages/{uuid.uuid4()}/report"
     ).status_code == 404
+
+
+# --- watching it ---------------------------------------------------------------------
+
+
+def test_the_health_figures_say_what_ask_jeene_has_been_doing(client, fresh, monkeypatch):
+    """The numbers the design document said to watch.
+
+    `refusal_rate` near zero means it is answering past what the material supports; very
+    high means the material is too thin to be worth asking. `ungrounded` is different in
+    kind — it is answers thrown away for citing material they were never given, and it is
+    a bug rather than a signal, so it must read zero.
+    """
+    from app.config import settings
+    monkeypatch.setattr(settings, "jeene_reconcile_secret", "s3cret", raising=False)
+
+    ask(client)                                     # answered
+    fresh.reply = DoubtAnswer(
+        answer="That belongs to another chapter.", answered=False,
+        used_concept_ids=[], used_question_ids=[], used_notes=False)
+    ask(client)                                     # the model declining
+    fresh.reply = DoubtAnswer(
+        answer="Invented.", answered=True,
+        used_concept_ids=["C99"], used_question_ids=[], used_notes=False)
+    ask(client)                                     # thrown away by the check
+
+    body = client.get("/internal/doubts/health",
+                      headers={"X-Jeene-Reconcile": "s3cret"}).json()
+
+    assert body["asked"] == 3
+    assert body["answered"] == 1
+    assert body["declined"] == 2, "the model's refusal and the dropped answer"
+    assert body["ungrounded"] == 1, "only the one we threw away"
+    assert body["refusal_rate"] == round(2 / 3, 3)
+    assert body["students"] == 1
+    assert body["tokens_in"] > 0
+    assert any("A Chapter" in c for c in body["busiest_chapters"])
+
+
+def test_nobody_reads_the_health_figures_without_the_secret(client, monkeypatch):
+    """Nothing here returns what a student wrote, but the shape of somebody's week is not
+    public either — and an unset secret is a refusal rather than a way in."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "jeene_reconcile_secret", "s3cret", raising=False)
+    assert client.get("/internal/doubts/health").status_code == 403
+    assert client.get("/internal/doubts/health",
+                      headers={"X-Jeene-Reconcile": "wrong"}).status_code == 403
+
+    monkeypatch.setattr(settings, "jeene_reconcile_secret", None, raising=False)
+    assert client.get("/internal/doubts/health",
+                      headers={"X-Jeene-Reconcile": "s3cret"}).status_code == 503

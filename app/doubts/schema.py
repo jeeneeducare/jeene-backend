@@ -26,21 +26,24 @@ class DoubtAnswer(BaseModel):
     )
     answered: bool = Field(
         description=(
-            "True only if the material you were given settles the question. False if it "
-            "does not, if the question is about something other than this chapter, or "
-            "if you are declining for any other reason — and then say why in `answer`."
+            "True if you were able to answer the question from the material, even "
+            "partly. Partly counts: if the material explains most of it, answer that "
+            "much, say in `answer` which part you could not cover, and still set this "
+            "true. False only when the material let you answer none of it — the "
+            "question is about another chapter or another subject, or is not a doubt "
+            "about what they are studying, or you are declining for safety."
         )
     )
     used_concept_ids: list[str] = Field(
         description=(
-            "The ids in square brackets of the concepts you actually drew on, copied "
-            "exactly from the material. Empty if none. Never an id you were not given."
+            "The short references — C1, C7 — of the concepts you actually drew on, "
+            "without their brackets. Empty if none. Only references the material shows."
         )
     )
     used_question_ids: list[str] = Field(
         description=(
-            "The ids in square brackets of the questions or worked examples you actually "
-            "drew on, copied exactly from the material. Empty if none."
+            "The short references — Q1, Q3 — of the questions or worked examples you "
+            "actually drew on, without their brackets. Empty if none."
         )
     )
     used_notes: bool = Field(

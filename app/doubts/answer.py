@@ -160,24 +160,35 @@ def _sort_citations(
     than the material, and since there is no way to tell which sentences came from where,
     the whole answer goes. Nothing less than that is safe to show a student.
 
-    Two things that look like violations and are not, both found on the first real runs:
+    What the model is asked to copy is a short reference — `C4`, `Q2` — not an id, for the
+    reason `Material.citation_labels` gives. Three things that look like violations and
+    are not, all found by running real doubts rather than by thinking about them:
 
-    - **Brackets.** The material block writes `[c_escape] Escape Speed — …`, so ids came
-      back wearing the brackets. The model copied what it was shown, as asked, and a good
+    - **Brackets.** The block writes `[C4] Escape Speed — …`, so references came back
+      wearing the brackets. The model copied what it was shown, as asked, and a good
       answer was thrown away for punctuation.
-    - **The wrong field.** A question id turned up under `used_concept_ids`. It was still
-      an id we sent; the model just filed it wrong. Moving it is right — dropping the
-      answer would be punishing a clerical slip with the penalty meant for invention.
+    - **The wrong field.** A question reference turned up under `used_concept_ids`. It
+      was still something we sent; the model just filed it wrong. Moving it is right —
+      dropping the answer would punish a clerical slip with the penalty meant for
+      invention.
+    - **Long ids.** Before references existed, a sigma-and-pi-bonds answer was binned
+      four times out of four for citing `chem_11_ch4_vb_theory_overlap_concept`: two real
+      ids conflated, one middle segment dropped. That was the block's fault, not the
+      model's.
 
-    Tolerating both costs nothing, because neither weakens the actual check.
+    Tolerating all three costs nothing, because none of them weakens the actual check.
     """
     concepts: list[str] = []
     questions: list[str] = []
     allowed_concepts = material.concept_ids()
     allowed_questions = material.question_ids()
+    by_label = material.citation_labels()
 
-    for reported_id in list(parsed.used_concept_ids) + list(parsed.used_question_ids):
-        node_id = _clean(reported_id)
+    for reported in list(parsed.used_concept_ids) + list(parsed.used_question_ids):
+        cleaned = _clean(reported)
+        # A reference first, because that is what the material shows. A real id second,
+        # so that a model which somehow produces one is not punished for being right.
+        node_id = by_label.get(cleaned.upper(), cleaned)
         if node_id in allowed_concepts:
             bucket = concepts
         elif node_id in allowed_questions:

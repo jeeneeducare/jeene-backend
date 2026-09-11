@@ -882,3 +882,32 @@ class DoubtThread(BaseModel):
     chapter_title: str
     messages: list[DoubtMessage]
     doubts_left_today: int
+
+
+class DoubtHealth(BaseModel):
+    """What Ask Jeene has been doing, for whoever is watching it.
+
+    Two numbers decide whether this feature is well. **`refusal_rate`** near zero means it
+    is answering things the material does not support — inventing. Very high means the
+    material is too thin to be worth asking. Somewhere in between is the feature working,
+    and the evaluation set sits at roughly half by construction.
+
+    **`ungrounded`** should be zero. It counts answers thrown away for citing material
+    they were never given, and it is the one number here that is a bug rather than a
+    signal: the prompt or the material block has drifted.
+    """
+
+    days: int
+    asked: int
+    answered: int
+    declined: int
+    refusal_rate: float
+    #: Answers dropped by the citation check. Logged, never shown to a student.
+    ungrounded: int
+    #: Students who said an answer was wrong. The best bug reports this feature will get.
+    reported: int
+    students: int
+    tokens_in: int
+    tokens_out: int
+    #: Chapters the doubts came from, most asked first. Where the material is being tested.
+    busiest_chapters: list[str] = []
