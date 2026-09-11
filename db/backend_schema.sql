@@ -563,3 +563,82 @@ CREATE INDEX IF NOT EXISTS idx_grants_user
 -- stays the truth; this exists so the gate on a practice request is one indexed read
 -- rather than an aggregate. Null means "never had access".
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_expires_at TIMESTAMPTZ;
+
+
+-- =====================================================================================
+-- Ask Jeene — doubts asked while studying
+-- =====================================================================================
+--
+-- A student reading a chapter asks a question and is answered out of material this app
+-- already owns: the concept descriptions, the worked solutions, and the chapter's notes.
+-- What is stored here is the conversation and, for every answer, exactly what it was
+-- built from.
+--
+-- That last part is not bookkeeping. It is how an answer can be checked rather than
+-- trusted — an id cited here that was never supplied to the model means it went outside
+-- its material — and with under-18 students and a generative feature, being able to
+-- answer "what did it say to this child" is not optional.
+
+-- One thread per student per chapter.
+--
+-- Not per question and not per session: a student working through Gravitation asks about
+-- question 14, then about the concept behind it, then about question 17, and that is one
+-- conversation. The anchor lives on each message instead, so the thread follows the
+-- chapter while every turn remembers exactly what was on screen.
+CREATE TABLE IF NOT EXISTS doubt_threads (
+  thread_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  firebase_uid    TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
+  tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
+  chapter_id      TEXT NOT NULL REFERENCES nodes(node_id),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_message_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The "one per student per chapter" rule, enforced rather than remembered: opening the
+-- same chapter twice must continue the conversation, not start a second one.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_doubt_thread_per_chapter
+  ON doubt_threads (firebase_uid, chapter_id);
+CREATE INDEX IF NOT EXISTS idx_doubt_threads_recent
+  ON doubt_threads (firebase_uid, last_message_at DESC);
+
+
+CREATE TABLE IF NOT EXISTS doubt_messages (
+  message_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  thread_id         UUID NOT NULL REFERENCES doubt_threads(thread_id) ON DELETE CASCADE,
+  -- Denormalised from the thread, the same way `attempts.tenant_id` is, so the daily
+  -- allowance is one indexed read rather than a join on the hottest check in the feature.
+  firebase_uid      TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE CASCADE,
+  role              TEXT NOT NULL CHECK (role IN ('student', 'jeene')),
+  text              TEXT NOT NULL,
+
+  -- What was on screen when they asked. Null on Jeene's own messages.
+  anchor_kind       TEXT CHECK (anchor_kind IN ('question', 'notes', 'node')),
+  anchor_id         TEXT,
+
+  -- What the answer was actually built from. Every id here was handed to the model; one
+  -- that was not is the signal that it answered from memory instead of from the material.
+  used_concept_ids  TEXT[] NOT NULL DEFAULT '{}',
+  used_question_ids TEXT[] NOT NULL DEFAULT '{}',
+  used_notes        BOOLEAN NOT NULL DEFAULT FALSE,
+  -- False when the material did not settle the question and Jeene said so. Watching this
+  -- rate is how you tell a doubt solver that is inventing from one that is too thin:
+  -- near zero means the first, very high means the second.
+  answered          BOOLEAN,
+
+  -- What it cost, so the real figure replaces an estimate after a week of use.
+  model             TEXT,
+  tokens_in         INTEGER,
+  tokens_out        INTEGER,
+
+  -- A student saying this was wrong. The best bug reports in the feature will come from
+  -- here, and there is nowhere else they could come from.
+  reported          BOOLEAN NOT NULL DEFAULT FALSE,
+
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_doubt_messages_thread
+  ON doubt_messages (thread_id, created_at);
+-- The daily allowance: a student's own messages, over a rolling day.
+CREATE INDEX IF NOT EXISTS idx_doubt_messages_allowance
+  ON doubt_messages (firebase_uid, created_at DESC) WHERE role = 'student';
