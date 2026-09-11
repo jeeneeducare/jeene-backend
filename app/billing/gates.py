@@ -49,12 +49,19 @@ FREE_PLANS_EVER = 1
 #: what the material is like before paying for the rest.
 FREE_CHAPTERS_PER_SUBJECT = 1
 
+#: Doubts a day, for a Pro student. Not a free-tier number: Ask Jeene is Pro-only, so this
+#: is not rationing who gets in. It is the ceiling on what one student can spend, because
+#: every doubt is a model call against a real account, and a rolling window so a student in
+#: any timezone gets the same ten.
+PRO_DOUBTS_PER_DAY = 10
+
 # --- what a client is told ---------------------------------------------------------------
 
 PRO_ONLY = "pro_only"
 DAILY_PRACTICE_LIMIT = "daily_practice_limit"
 PLAN_LIMIT = "plan_limit"
 CHAPTER_LOCKED = "chapter_locked"
+DAILY_DOUBT_LIMIT = "daily_doubt_limit"
 
 
 def enforced() -> bool:
@@ -199,6 +206,68 @@ async def ensure_can_plan(connection: asyncpg.Connection, uid: str, tenant: str)
             "like, and rebuilds them as you improve.",
             used=made, limit=FREE_PLANS_EVER,
         )
+
+
+# --- Ask Jeene ---------------------------------------------------------------------------
+
+
+async def ensure_can_ask(connection: asyncpg.Connection, uid: str, tenant: str) -> None:
+    """Pro only, and ten a day even then.
+
+    The two halves answer to different questions and only one of them respects the billing
+    flag, which is a deliberate break from every other gate in this file.
+
+    *Whether* Ask Jeene sits behind Pro is a monetisation decision, and like the rest it is
+    off until Pro can actually be bought — a feature locked with no way to unlock it is
+    worse than an open one.
+
+    *How many* a student may ask in a day is not a monetisation decision at all. Each doubt
+    is a model call billed to a real account, and a deployment with billing switched off is
+    precisely the one where nobody is watching that bill. So the cap applies either way.
+
+    Counted from the messages themselves rather than a counter column, for the same reason
+    the practice allowance is: a row is what a student actually received, and a counter
+    incremented beside a write that then failed is a student charged for nothing.
+    """
+    if enforced():
+        await ensure_pro(
+            connection, uid, tenant,
+            message=(
+                "Ask Jeene is part of Pro. Get answers to your doubts while you study, "
+                "from this chapter's own notes and solutions."
+            ),
+        )
+
+    asked = await connection.fetchval(
+        """
+        SELECT count(*) FROM doubt_messages
+         WHERE firebase_uid = $1
+           AND role = 'student'
+           AND created_at > now() - interval '1 day'
+        """,
+        uid,
+    )
+    if asked >= PRO_DOUBTS_PER_DAY:
+        raise blocked(
+            DAILY_DOUBT_LIMIT,
+            f"You have asked Jeene {PRO_DOUBTS_PER_DAY} doubts today. The count resets "
+            "through the day, so come back to it a little later.",
+            used=asked, limit=PRO_DOUBTS_PER_DAY,
+        )
+
+
+async def doubts_left_today(connection: asyncpg.Connection, uid: str) -> int:
+    """How many of today's ten are unspent, for the screen to show before they ask."""
+    asked = await connection.fetchval(
+        """
+        SELECT count(*) FROM doubt_messages
+         WHERE firebase_uid = $1
+           AND role = 'student'
+           AND created_at > now() - interval '1 day'
+        """,
+        uid,
+    )
+    return max(0, PRO_DOUBTS_PER_DAY - asked)
 
 
 # --- notes and lectures ------------------------------------------------------------------

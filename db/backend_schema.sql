@@ -637,6 +637,12 @@ CREATE TABLE IF NOT EXISTS doubt_messages (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- `clock_timestamp()`, not `now()`. A question and its answer are written in one
+-- transaction, and `now()` is the transaction's start time — so both rows would carry the
+-- same instant and the thread would order by the tiebreak, which is a random uuid. The
+-- answer rendering above the question is not a subtle failure.
+ALTER TABLE doubt_messages ALTER COLUMN created_at SET DEFAULT clock_timestamp();
+
 CREATE INDEX IF NOT EXISTS idx_doubt_messages_thread
   ON doubt_messages (thread_id, created_at);
 -- The daily allowance: a student's own messages, over a rolling day.

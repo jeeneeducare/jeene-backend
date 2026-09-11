@@ -181,3 +181,91 @@ SELECT order_id, firebase_uid, amount_paise, failure_reason, updated_at
 
 Each one is a person deciding between granting access and refunding — by then the student
 has been told it failed and may well have paid again.
+
+## Ask Jeene (doubt solving)
+
+Separate from Jeene Mode in every way that matters. Jeene Mode plans a chapter; Ask Jeene
+answers one doubt about the chapter a student is already reading, from that chapter's own
+concepts, worked solutions and notes. They share a provider port and nothing else — their
+flags, their models and their failure modes are all independent, on purpose.
+
+### 1. Apply the schema
+
+```bash
+psql "<the same DATABASE_URL Render uses>" -f db/backend_schema.sql
+```
+
+Adds `doubt_threads` and `doubt_messages`, and sets `doubt_messages.created_at` to default
+to `clock_timestamp()`. That last one is not cosmetic: a question and its answer are
+written in one transaction, `now()` is the transaction's start time, and two rows sharing
+an instant order by their random uuid — which shows a student the answer above the question
+it answers.
+
+Safe to re-run, like the rest of the file.
+
+### 2. Set the environment variables
+
+| Key | Value | Needed? |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | the project key | **Yes** — the same key Jeene Mode uses |
+| `JEENE_DOUBTS_MODEL` | `gpt-5-mini` | **Yes** |
+| `JEENE_DOUBTS_ENABLED` | `true` | **Yes**, or `/doubts/ask` answers 503 and says so |
+
+Leaving any of the three unset is a supported configuration: the route answers 503 with
+"Ask Jeene is not available right now", and every other part of the chapter still works.
+It is also the switch to reach for if answers start going wrong — turn
+`JEENE_DOUBTS_ENABLED` off and nothing else changes.
+
+**On the model.** Measured on real chapter material, four doubts each, at the ten-a-day
+cap:
+
+| | per answer | per heavy Pro student | latency |
+| --- | --- | --- | --- |
+| `gpt-5` | ₹0.82 | ₹247/month | 12–21s |
+| `gpt-5-mini` | ₹0.10 | ₹30/month | 6.5–10s |
+
+Quality was close enough that the eight-times cost difference decided it. Moving up is one
+environment variable if answers disappoint — and because the model id is recorded on every
+answer, you can tell afterwards which ones were written by which.
+
+### 3. What the gate does
+
+Pro only, and ten doubts a day even for Pro. The two halves answer to different things and
+only one of them follows `JEENE_BILLING_ENABLED`:
+
+* **Behind Pro** — a monetisation decision, so it turns off with billing, like every other
+  gate. With billing off, anybody can ask.
+* **Ten a day** — not a monetisation decision. Every doubt is a model call billed to a real
+  account, and a deployment with billing off is exactly the one where nobody is watching
+  that bill. The cap applies either way.
+
+A refused student has spent nothing: the gate runs before the model and the record is
+written after it.
+
+### 4. Content prerequisites
+
+An answer is built only from material that exists, and a chapter with nothing in it is
+refused before the call rather than after — an empty material block is how you get
+confident invention. In practice a chapter needs published concepts **with descriptions**;
+worked solutions and notes are used when they are there.
+
+All 1,517 published concepts have descriptions today, so every chapter qualifies. Notes
+exist for eight physics chapters and are used where present.
+
+### 5. Watching it
+
+Two numbers say whether it is healthy, both from `doubt_messages`:
+
+```sql
+-- Answers Jeene declined to give. Near zero means it is inventing; very high means the
+-- material is too thin. Somewhere in between is the feature working.
+SELECT count(*) FILTER (WHERE NOT answered)::float / count(*) AS refusal_rate
+  FROM doubt_messages WHERE role = 'jeene' AND created_at > now() - interval '7 days';
+
+-- Answers a student marked wrong. The best bug reports this feature will get.
+SELECT message_id, left(text, 120) FROM doubt_messages WHERE reported ORDER BY created_at DESC;
+```
+
+An answer dropped for citing material it was never given is logged as
+`doubt answer dropped reason=cited material it was not given`, with the offending ids and
+never the text. A rising count there means the prompt or the material block has drifted.

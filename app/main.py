@@ -13,6 +13,7 @@ from app.routers import (
     attempts,
     auth,
     content,
+    doubts,
     health,
     internal,
     mistakes,
@@ -59,6 +60,7 @@ app.include_router(tests.router)
 app.include_router(reports.router)
 app.include_router(mistakes.router)
 app.include_router(plans.router)
+app.include_router(doubts.router)
 app.include_router(admin.router)
 app.include_router(billing.router)
 app.include_router(internal.router)

@@ -1,7 +1,8 @@
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class HealthResponse(BaseModel):
@@ -832,3 +833,52 @@ class SettlementResponse(BaseModel):
     order_id: str
     status: str
     entitlement: EntitlementView | None = None
+
+
+# --- Ask Jeene -----------------------------------------------------------------------------
+
+
+class DoubtAsk(BaseModel):
+    """A question typed while studying, and where it was typed from.
+
+    The anchor is not decoration. It decides which chapter's material the answer is built
+    from, and an answer with no anchor would be an answer with no boundary.
+    """
+
+    anchor_kind: Literal["question", "notes", "node"]
+    anchor_id: str = Field(min_length=1, max_length=200)
+    #: Stripped before it is measured, so a stray tap that sends a space is refused here
+    #: rather than spending one of the student's ten on a model call about nothing.
+    text: Annotated[str, StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=1000)]
+
+
+class DoubtMessage(BaseModel):
+    """One turn of a thread."""
+
+    message_id: UUID
+    role: Literal["student", "jeene"]
+    text: str
+    created_at: datetime
+    #: Null on a student's own message; on Jeene's, false when it declined to answer.
+    answered: bool | None = None
+    reported: bool = False
+
+
+class DoubtReply(BaseModel):
+    """What the app draws after a student asks."""
+
+    thread_id: UUID
+    message: DoubtMessage
+    #: So a screen can say "3 left today" without a second request.
+    doubts_left_today: int
+
+
+class DoubtThread(BaseModel):
+    """A chapter's whole conversation, for reopening it."""
+
+    thread_id: UUID
+    chapter_id: str
+    chapter_title: str
+    messages: list[DoubtMessage]
+    doubts_left_today: int
