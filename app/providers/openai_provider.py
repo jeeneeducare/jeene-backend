@@ -33,7 +33,8 @@ _MAX_RETRIES = 0
 _MAX_OUTPUT_TOKENS = 8000
 
 # Reading a message returns an id, two enums and at most a sentence. The ceiling is here
-# to bound a runaway, not to fit the answer.
+# to bound a runaway, not to fit the answer — a caller whose answer is longer than that,
+# like a doubt reply, passes its own.
 _MAX_READ_TOKENS = 600
 
 # See read_json: cheap call, expensive failure.
@@ -43,11 +44,20 @@ _READ_RETRIES = 1
 class OpenAIPlannerProvider:
     name = "openai"
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, reasoning_effort: str | None = None):
         self.model = model
+        # How hard the model thinks before writing, on the models that have the setting.
+        # Configured per instance rather than per call because it belongs to the job: a
+        # plan is a genuine reasoning problem, and explaining a chapter's own material
+        # back to a student is not — it is mostly reading. Left unset, the model's own
+        # default applies, which is what every existing caller gets.
+        self._reasoning_effort = reasoning_effort
         self._client = AsyncOpenAI(
             api_key=api_key, timeout=_TIMEOUT_SECONDS, max_retries=_MAX_RETRIES
         )
+
+    def _extra(self) -> dict:
+        return {"reasoning_effort": self._reasoning_effort} if self._reasoning_effort else {}
 
     async def generate_plan(
         self,
@@ -92,12 +102,16 @@ class OpenAIPlannerProvider:
         cached = 0
         if usage is not None and usage.prompt_tokens_details is not None:
             cached = usage.prompt_tokens_details.cached_tokens or 0
+        reasoning = 0
+        if usage is not None and usage.completion_tokens_details is not None:
+            reasoning = usage.completion_tokens_details.reasoning_tokens or 0
         return parsed, ProviderUsage(
             provider=self.name,
             model=completion.model,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
             cached_input_tokens=cached,
+            reasoning_tokens=reasoning,
             latency_ms=elapsed,
         )
 
@@ -108,6 +122,7 @@ class OpenAIPlannerProvider:
         context: str,
         user_text: str,
         schema: type[BaseModel],
+        max_output_tokens: int | None = None,
     ) -> tuple[BaseModel, ProviderUsage]:
         # Static prompt, then the catalogue, then the student. The first two are
         # identical on every call and are what the provider's prefix cache can hold;
@@ -133,7 +148,8 @@ class OpenAIPlannerProvider:
                 model=self.model,
                 messages=messages,
                 response_format=schema,
-                max_completion_tokens=_MAX_READ_TOKENS,
+                max_completion_tokens=max_output_tokens or _MAX_READ_TOKENS,
+                **self._extra(),
             )
         except OpenAIError as exc:
             raise ProviderError(f"{type(exc).__name__} from {self.name}") from None
@@ -150,12 +166,16 @@ class OpenAIPlannerProvider:
         cached = 0
         if usage is not None and usage.prompt_tokens_details is not None:
             cached = usage.prompt_tokens_details.cached_tokens or 0
+        reasoning = 0
+        if usage is not None and usage.completion_tokens_details is not None:
+            reasoning = usage.completion_tokens_details.reasoning_tokens or 0
         return parsed, ProviderUsage(
             provider=self.name,
             model=completion.model,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
             cached_input_tokens=cached,
+            reasoning_tokens=reasoning,
             latency_ms=elapsed,
         )
 

@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     jeene_planner_model: str | None = None
     jeene_planner_enabled: bool = False
 
+    # Ask Jeene, the doubt solver. Its own model rather than the planner's: the two
+    # calls want different things — a plan is a small structured object chosen from a
+    # catalogue, an answer is prose a student will read as the app's own — and being
+    # able to move one without the other is the point of separating them. Same key.
+    jeene_doubts_model: str | None = None
+    jeene_doubts_enabled: bool = False
+
     # Signs the short-lived links the app uses to open files we host — today the chapter
     # notes viewer. Optional so a laptop needs no setup: without it every process signs
     # with its own random secret, which is correct for one worker and broken for two.

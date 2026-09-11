@@ -26,6 +26,11 @@ class ProviderUsage(BaseModel):
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    # Part of `output_tokens`, not extra to it, and billed at the output rate. On a
+    # reasoning model this is most of what you pay for on a short answer, and it counts
+    # against the output ceiling — a ceiling sized for the visible reply truncates the
+    # reply mid-sentence, which arrives as an unparseable response rather than a short one.
+    reasoning_tokens: int = 0
     # Providers cache long identical prefixes automatically. This is how you find out
     # whether the static half of the prompt is actually stable — a timestamp anywhere in
     # it silently drives this to zero.
@@ -63,6 +68,7 @@ class PlannerProvider(Protocol):
         context: str,
         user_text: str,
         schema: type[BaseModel],
+        max_output_tokens: int | None = None,
     ) -> tuple[BaseModel, ProviderUsage]:
         """Answer a question about `user_text`, in the shape of `schema`.
 
@@ -74,5 +80,10 @@ class PlannerProvider(Protocol):
         `context` is the caller's catalogue and `user_text` is the student's own words.
         They stay separate messages so the provider can cache the first and so the
         second is never mistaken for instructions.
+
+        `max_output_tokens` is the caller's because only the caller knows how long a good
+        answer is. Reading a message returns a sentence; answering a doubt returns four
+        paragraphs, and one ceiling cannot be right for both — too low silently truncates
+        into an unparseable reply, and too high only bounds a runaway.
         """
         ...
