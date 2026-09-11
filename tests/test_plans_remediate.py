@@ -207,21 +207,56 @@ def test_the_attempts_are_kept(client):
 @integration
 def test_the_plan_stops_growing(client):
     """Past the cap the check still reopens — a student always gets another honest
-    attempt — but the plan does not keep getting longer."""
+    attempt — but the plan does not keep getting longer.
+
+    What is deliberately *not* asserted here is that every miss adds work. A round adds
+    nothing when the concepts it found already have a step, and which concepts a check
+    lands on varies: the questions are drawn by a hash salted per plan item, so two runs
+    of this test miss different things in a different order. The cap counts rounds the
+    plan actually grew, not times the check was handed in, and that is the property worth
+    holding — an earlier version of this test asserted the other one and failed roughly
+    one run in fifteen, for a reason that was never a bug.
+    """
     plan = _plan(client)
 
-    rounds = []
-    for _ in range(remediate.MAX_ROUNDS + 2):
+    grew = []
+    for _ in range(remediate.MAX_ROUNDS + 3):
         current = client.get(f"/plans/{plan['plan_id']}").json()
         _, result = _fail_the_check(client, current)
-        rounds.append(len(result["added_steps"]))
+        grew.append(len(result["added_steps"]))
 
-    assert all(n > 0 for n in rounds[: remediate.MAX_ROUNDS]), rounds
-    assert all(n == 0 for n in rounds[remediate.MAX_ROUNDS :]), rounds
+    assert grew[0] > 0, "a first miss that adds nothing is a locked door"
+
+    final = client.get(f"/plans/{plan['plan_id']}").json()
+    rounds = sorted({s["remediation_round"] for s in final["steps"]
+                     if s["remediation_round"]})
+    assert rounds == list(range(1, remediate.MAX_ROUNDS + 1)), (
+        f"grew={grew} rounds={rounds}"
+    )
+
+    # At the cap, handing it in again adds nothing at all.
+    _, capped = _fail_the_check(client, final)
+    assert capped["added_steps"] == []
 
     # And the last refusal still gave them a fresh check to sit.
     final = client.get(f"/plans/{plan['plan_id']}").json()
     assert _open(client, plan["plan_id"], _checkpoint(final)["step_id"])["questions"]
+
+
+@integration
+def test_a_concept_is_not_remediated_twice(client):
+    """Missing the same idea again is a reason to attempt it again, not a reason to be
+    handed a second "Fix: …" step for it. This is what makes a round legitimately add
+    nothing, so it is the half of that behaviour worth pinning down."""
+    plan = _plan(client)
+    for _ in range(remediate.MAX_ROUNDS + 3):
+        current = client.get(f"/plans/{plan['plan_id']}").json()
+        _fail_the_check(client, current)
+
+    steps = client.get(f"/plans/{plan['plan_id']}").json()["steps"]
+    focused = [tuple(s["focus_node_ids"]) for s in steps if s["remediation_round"]]
+    assert focused, "nothing was remediated, so this proves nothing"
+    assert len(focused) == len(set(focused)), focused
 
 
 # --- passing --------------------------------------------------------------------------
