@@ -131,6 +131,8 @@ async def ask(
         thread_id=thread_id,
         message=_as_message(message),
         doubts_left_today=await gates.doubts_left_today(connection, user["uid"]),
+        chapter_id=anchor.chapter_id,
+        chapter_title=anchor.chapter_title,
     )
 
 
@@ -157,6 +159,8 @@ async def thread(
         user["uid"], chapter_id, tenant,
     )
     left = await gates.doubts_left_today(connection, user["uid"])
+    # The wall they would meet if they asked now, so the sheet says so before they type.
+    gate = await gates.doubt_gate(connection, user["uid"], tenant)
     if row is None:
         # Not a 404. "You have not asked anything about this chapter yet" is an empty
         # thread, and an empty screen is what the app should draw for it.
@@ -168,7 +172,7 @@ async def thread(
             raise HTTPException(status_code=404, detail="No such chapter")
         return DoubtThread(
             thread_id=UUID(int=0), chapter_id=chapter_id, chapter_title=title,
-            messages=[], doubts_left_today=left,
+            messages=[], doubts_left_today=left, gate=gate,
         )
 
     messages = await store.conversation(connection, row["thread_id"])
@@ -178,6 +182,7 @@ async def thread(
         chapter_title=row["chapter_title"],
         messages=[_as_message(m) for m in messages],
         doubts_left_today=left,
+        gate=gate,
     )
 
 

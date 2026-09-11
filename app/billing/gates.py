@@ -256,8 +256,33 @@ async def ensure_can_ask(connection: asyncpg.Connection, uid: str, tenant: str) 
         )
 
 
+async def doubt_gate(
+    connection: asyncpg.Connection, uid: str, tenant: str
+) -> GateBlocked | None:
+    """The wall this student would hit if they asked now, or None if they may ask.
+
+    The same decision `ensure_can_ask` makes, returned instead of raised, so the sheet can
+    draw the wall *before* a student types a question into it. Without this a free student
+    opens Ask Jeene, is told "10 left today", writes out their doubt, taps send, and only
+    then learns the feature is not theirs — which is the rudest possible order to find out.
+    """
+    try:
+        await ensure_can_ask(connection, uid, tenant)
+    except HTTPException as refusal:
+        # `blocked()` serialises the model into the detail, because that is what FastAPI
+        # has to put on the wire. Coming back the other way it has to be rebuilt.
+        detail = refusal.detail
+        return GateBlocked(**detail) if isinstance(detail, dict) else None
+    return None
+
+
 async def doubts_left_today(connection: asyncpg.Connection, uid: str) -> int:
-    """How many of today's ten are unspent, for the screen to show before they ask."""
+    """How many of today's ten are unspent, for the screen to show before they ask.
+
+    Says nothing about whether this student may ask at all — that is `doubt_gate`, and a
+    screen showing this number without also asking that one will promise an allowance to
+    somebody who has none.
+    """
     asked = await connection.fetchval(
         """
         SELECT count(*) FROM doubt_messages

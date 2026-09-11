@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 #: trims to, so the trimming decision lives in one place — here we just fetch enough.
 HISTORY_DEPTH = 12
 
+#: Messages handed back for one chapter. A student at ten a day who keeps returning to
+#: one chapter accumulates without limit, and an answer is around 1,500 characters — so an
+#: unbounded read is a few hundred kilobytes of JSON on mobile data every time the sheet is
+#: opened. Twenty-five exchanges is far more of one chapter's conversation than anybody
+#: scrolls back through.
+MAX_THREAD_MESSAGES = 50
+
 #: What a student may send in one doubt. Long enough to paste a question they typed out,
 #: short enough that nobody is mailing an essay through a model call. Refused at the
 #: boundary rather than truncated: a silently cut-off question gets a confident answer to
@@ -90,15 +97,25 @@ async def history(
 async def conversation(
     connection: asyncpg.Connection, thread_id: UUID
 ) -> list[StoredMessage]:
-    """The whole thread, oldest first, for the screen."""
+    """The thread's most recent messages, oldest first, for the screen.
+
+    Bounded — see `MAX_THREAD_MESSAGES`. Taken from the recent end and then reversed,
+    because the cap has to drop the oldest: a conversation truncated at the *new* end
+    would open on something the student said months ago with their last answer missing.
+    """
     rows = await connection.fetch(
         """
         SELECT message_id, role, text, created_at, answered, reported
-          FROM doubt_messages
-         WHERE thread_id = $1
+          FROM (
+            SELECT message_id, role, text, created_at, answered, reported
+              FROM doubt_messages
+             WHERE thread_id = $1
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT $2
+          ) recent
          ORDER BY created_at, message_id
         """,
-        thread_id,
+        thread_id, MAX_THREAD_MESSAGES,
     )
     return [StoredMessage(**dict(r)) for r in rows]
 

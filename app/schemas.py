@@ -872,16 +872,33 @@ class DoubtReply(BaseModel):
     message: DoubtMessage
     #: So a screen can say "3 left today" without a second request.
     doubts_left_today: int
+    #: Which chapter this actually joined, which the server decides and the app does not.
+    #:
+    #: An anchor resolves to its own chapter here — a question to the chapter of its
+    #: primary concept — and that is the thread the exchange was written to. The app sends
+    #: a chapter for the thread it is *showing*, and the two can disagree: a question
+    #: mapped primarily into another chapter, or a surface that does not know its chapter
+    #: at all, like a plan step whose scope is a topic. Sending it back lets the sheet
+    #: correct itself instead of displaying one thread while writing to another.
+    chapter_id: str
+    chapter_title: str
 
 
 class DoubtThread(BaseModel):
-    """A chapter's whole conversation, for reopening it."""
+    """A chapter's conversation, for reopening it."""
 
     thread_id: UUID
     chapter_id: str
     chapter_title: str
+    #: Most recent first-to-last, capped — see `store.MAX_THREAD_MESSAGES`.
     messages: list[DoubtMessage]
     doubts_left_today: int
+    #: The wall this student would hit if they asked now, or null if they may ask.
+    #:
+    #: Sent with the thread so the sheet can draw it *before* a question is typed into it.
+    #: Without it a free student opens Ask Jeene, is told how many doubts are left, writes
+    #: theirs out, taps send, and only then learns the feature is not theirs.
+    gate: GateBlocked | None = None
 
 
 class DoubtHealth(BaseModel):

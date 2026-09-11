@@ -514,3 +514,73 @@ def test_nobody_reads_the_health_figures_without_the_secret(client, monkeypatch)
     monkeypatch.setattr(settings, "jeene_reconcile_secret", None, raising=False)
     assert client.get("/internal/doubts/health",
                       headers={"X-Jeene-Reconcile": "s3cret"}).status_code == 503
+
+
+# --- the wall arrives before the typing ------------------------------------------------
+
+
+def test_a_free_student_is_told_before_they_write_their_question(client):
+    """Found by audit: the counter knows nothing about Pro.
+
+    A free student opened the sheet, was told "10 left today", wrote out their doubt,
+    tapped send, and only then learned the feature was not theirs. The thread now carries
+    the wall they would hit, so the sheet can draw it before the box is ever live.
+    """
+    CALLER["uid"] = FREE
+    body = client.get(f"/doubts/chapters/{CHAPTER}").json()
+
+    assert body["gate"] is not None
+    assert body["gate"]["reason"] == gates.PRO_ONLY
+
+
+def test_a_pro_student_with_doubts_left_meets_no_wall(client):
+    body = client.get(f"/doubts/chapters/{CHAPTER}").json()
+
+    assert body["gate"] is None
+    assert body["doubts_left_today"] == gates.PRO_DOUBTS_PER_DAY
+
+
+def test_a_pro_student_out_of_doubts_is_told_on_opening(client):
+    _spend(PRO, gates.PRO_DOUBTS_PER_DAY)
+    body = client.get(f"/doubts/chapters/{CHAPTER}").json()
+
+    assert body["gate"]["reason"] == gates.DAILY_DOUBT_LIMIT
+    assert body["doubts_left_today"] == 0
+
+
+def test_a_thread_does_not_grow_without_limit(client):
+    """A student at ten a day who keeps returning to one chapter accumulates for ever,
+    and an answer is around 1,500 characters — an unbounded read is a few hundred
+    kilobytes of JSON on mobile data every time the sheet opens."""
+    from app.doubts import store as doubt_store
+
+    thread_id = _sql(
+        """INSERT INTO doubt_threads (firebase_uid, tenant_id, chapter_id)
+           VALUES ($1,$2,$3) ON CONFLICT (firebase_uid, chapter_id)
+           DO UPDATE SET last_message_at = now() RETURNING thread_id""",
+        PRO, TENANT, CHAPTER)[0]["thread_id"]
+    for i in range(doubt_store.MAX_THREAD_MESSAGES + 12):
+        _sql("""INSERT INTO doubt_messages (thread_id, firebase_uid, role, text)
+                VALUES ($1,$2,'student',$3)""", thread_id, PRO, f"m{i}")
+
+    messages = client.get(f"/doubts/chapters/{CHAPTER}").json()["messages"]
+
+    assert len(messages) == doubt_store.MAX_THREAD_MESSAGES
+    # The oldest are what gets dropped. Truncating the other end would open the sheet on
+    # something said months ago with the latest answer missing.
+    assert messages[-1]["text"] == f"m{doubt_store.MAX_THREAD_MESSAGES + 11}"
+    assert messages[0]["text"] == "m12"
+
+
+def test_the_reply_says_which_chapter_it_joined(client):
+    """The server decides which thread an anchor belongs to, not the app.
+
+    A question resolves to the chapter of its primary concept, and that is where the
+    exchange is written. A surface that does not know its chapter — a plan step whose
+    scope is a topic — can therefore still ask, and the sheet corrects itself from this
+    rather than showing one thread while writing to another.
+    """
+    body = ask(client, kind="question", anchor=QUESTION).json()
+
+    assert body["chapter_id"] == CHAPTER
+    assert body["chapter_title"] == "A Chapter"
