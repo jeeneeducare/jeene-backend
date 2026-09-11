@@ -7,3 +7,5 @@ openai==3.6.0
 # Streams the notes PDF from storage; see app/routers/notes.py. Already present as
 # a transitive dependency of openai and firebase-admin, pinned here because we import it.
 httpx==0.28.1
+# Reads the text out of chapter notes so Ask Jeene can ground an answer in them.
+pypdf==6.18.0

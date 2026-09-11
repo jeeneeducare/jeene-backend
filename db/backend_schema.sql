@@ -193,6 +193,16 @@ CREATE TABLE IF NOT EXISTS chapter_notes (
 
 CREATE INDEX IF NOT EXISTS idx_chapter_notes_status ON chapter_notes (tenant_id, status);
 
+-- The notes as text, for Ask Jeene to quote. The reader streams the PDF and the student
+-- does the reading; a doubt solver cannot, and may only ground an answer in material it
+-- has been handed. Extracted once per document and refreshed when the row is touched.
+--
+-- `text_extracted_at` is null until it has been tried. Set with an empty `extracted_text`
+-- it means the document was read and held no text — an image-only PDF — which is recorded
+-- so it is attempted once rather than on every question about that chapter.
+ALTER TABLE chapter_notes ADD COLUMN IF NOT EXISTS extracted_text    TEXT NOT NULL DEFAULT '';
+ALTER TABLE chapter_notes ADD COLUMN IF NOT EXISTS text_extracted_at TIMESTAMPTZ;
+
 
 -- Videos, at any level of the tree.
 --
