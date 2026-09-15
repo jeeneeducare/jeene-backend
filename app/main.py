@@ -5,7 +5,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import db
+from app import db, refusals
 from app.auth import init_firebase
 from app.routers import (
     admin,
@@ -50,6 +50,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Test-Token"],
+    # Without this a browser hands script only the CORS-safelisted response headers, so
+    # a web client could not read a refusal's audience and would fall back to its own
+    # line for the status — the exact bug these headers exist to fix, reappearing on one
+    # platform only. The native apps are not subject to CORS and would have hidden it.
+    expose_headers=[refusals.AUDIENCE_HEADER, refusals.ACTION_HEADER],
 )
 app.include_router(health.router)
 app.include_router(content.router)

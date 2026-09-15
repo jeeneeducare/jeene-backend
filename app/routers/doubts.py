@@ -26,7 +26,9 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import current_tenant, require_user
 from app.billing import gates
+from app import refusals
 from app.db import get_connection
+from app.refusals import refuse
 from app.doubts import answer as answer_module
 from app.doubts import context, store
 from app.doubts.provider import build_doubt_provider
@@ -94,9 +96,11 @@ async def ask(
     )
     if material.is_empty():
         logger.warning("no material for a doubt chapter=%s", anchor.chapter_id)
-        raise HTTPException(
-            status_code=422,
-            detail="There is nothing in this chapter for me to answer from yet.",
+        # Jeene's own words, and shown as such: the app's line for a 422 is "That did
+        # not go through", which reads as a fault rather than as the honest answer that
+        # this chapter has nothing to draw on yet.
+        raise refuse(
+            422, "There is nothing in this chapter for me to answer from yet."
         )
 
     thread_id = await store.thread_for(
@@ -111,9 +115,10 @@ async def ask(
         # line goes to a third-party log aggregator.
         logger.warning("the provider could not answer a doubt chapter=%s",
                        anchor.chapter_id)
-        raise HTTPException(
-            status_code=503,
-            detail="I could not reach my notes just now. Try again in a moment.",
+        raise refuse(
+            503,
+            "I could not reach my notes just now. Try again in a moment.",
+            action=refusals.WAIT,
         ) from None
 
     message = await store.record(

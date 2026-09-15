@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.plans import store
+from app.refusals import AUDIENCE_HEADER, STUDENT
 from app.plans.progress import plan_percent
 from app.routers import plans as plans_router
 from app.schemas import PlanCreate, PlanDetail, PlanStep, PlanStepItem, PlanSummary
@@ -396,10 +397,19 @@ def test_adding_a_provider_is_a_change_to_one_function():
 
 
 def test_a_scope_with_nothing_published_is_refused_rather_than_stored():
-    """A plan row with no steps sits in the history looking like work the student failed."""
+    """A plan row with no steps sits in the history looking like work the student failed.
+
+    Asserts the refusal rather than the literal `status_code=409`: the empty-scope
+    refusals are raised through `refuse`, which sends the same status with the sentence
+    marked as the student's to read, because "something changed, try again" was neither.
+    """
     source = inspect.getsource(plans_router.create_plan)
     assert "if not plan.steps:" in source
-    assert "status_code=409" in source
+    assert "refuse(409" in source
+
+    refusal = plans_router.refuse(409, "nothing here")
+    assert refusal.status_code == 409
+    assert refusal.headers[AUDIENCE_HEADER] == STUDENT
 
 
 def test_resuming_a_plan_costs_neither_a_slot_nor_a_generation():
