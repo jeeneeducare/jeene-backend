@@ -82,7 +82,7 @@ def test_a_selector_expands_a_subtopic_to_its_concepts():
     row in it.
     """
     connection = _FakeConnection()
-    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector()))
+    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector(), "neet"))
     query = connection.calls[0][0]
     assert "WITH RECURSIVE targets" in query
     assert "WHERE type = 'concept'" in query
@@ -93,7 +93,8 @@ def test_unrated_is_translated_to_a_null_check_not_compared_as_a_string():
     connection = _FakeConnection()
     asyncio.run(
         resolve_selector(
-            connection, "JEENE_MASTER", "uid", _selector(difficulty=["medium", "unrated"])
+            connection, "JEENE_MASTER", "uid",
+            _selector(difficulty=["medium", "unrated"]), "neet"
         )
     )
     query, args = connection.calls[0]
@@ -112,7 +113,7 @@ def test_an_unrated_only_selector_asks_only_for_ungraded_questions():
     """
     connection = _FakeConnection()
     asyncio.run(
-        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(difficulty=["unrated"]))
+        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(difficulty=["unrated"]), "neet")
     )
     args = connection.calls[0][1]
     assert args[4] == [], "not None — NULL would disable the filter entirely"
@@ -121,7 +122,7 @@ def test_an_unrated_only_selector_asks_only_for_ungraded_questions():
 
 def test_no_difficulty_at_all_is_the_only_thing_that_disables_the_filter():
     connection = _FakeConnection()
-    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector()))
+    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector(), "neet"))
     assert connection.calls[0][1][4] is None
 
 
@@ -143,7 +144,7 @@ def test_the_difficulty_filter_distinguishes_none_from_empty(difficulty, graded,
 def test_empty_filters_mean_any_rather_than_none():
     """A scope whose questions are all one type must not need the planner to enumerate."""
     connection = _FakeConnection()
-    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector()))
+    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector(), "neet"))
     args = connection.calls[0][1]
     assert args[3] is None, "no type filter"
     assert args[4] is None, "no difficulty filter"
@@ -153,10 +154,10 @@ def test_empty_filters_mean_any_rather_than_none():
 def test_a_selector_with_no_nodes_or_no_count_runs_no_query_at_all():
     connection = _FakeConnection()
     assert asyncio.run(
-        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(concept_node_ids=[]))
+        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(concept_node_ids=[]), "neet")
     ) == []
     assert asyncio.run(
-        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(count=0))
+        resolve_selector(connection, "JEENE_MASTER", "uid", _selector(count=0), "neet")
     ) == []
     assert connection.calls == []
 
@@ -179,16 +180,19 @@ def test_every_query_shape_passes_exactly_as_many_arguments_as_it_has_placeholde
     import re
 
     selector = _selector(order=order, exclude_seen=exclude_seen)
-    sql, args = _resolution_query(selector, "JEENE_MASTER", "uid", "salt")
+    sql, args = _resolution_query(selector, "JEENE_MASTER", "uid", "salt", "neet")
     highest = max(int(n) for n in re.findall(r"\$(\d+)", sql))
     assert highest == len(args), f"{order}: {highest} placeholders, {len(args)} args"
 
 
 def test_the_mixed_deck_is_salted_so_one_slice_does_not_serve_everyone():
     """Unsalted, a forty-question bank would have the same eight doing all the work."""
-    sql, args = _resolution_query(_selector(order="mixed"), "T", "uid", "item-1")
+    sql, args = _resolution_query(_selector(order="mixed"), "T", "uid", "item-1", "neet")
     assert "md5($8 || q.question_id)" in sql
-    assert args[-1] == "item-1"
+    # Positional, not last: the exam track is appended after the salt, so asserting on
+    # the tail would pass for a query that had silently shifted the salt one place and
+    # started hashing the student's exam instead of the item id.
+    assert args[7] == "item-1", "the salt has to be the argument $8 actually names"
 
 
 def test_mixed_is_deterministic_rather_than_random():
@@ -217,7 +221,7 @@ def test_excluding_seen_questions_tops_up_with_the_oldest_rather_than_giving_up(
     connection = _FakeConnection()
     asyncio.run(
         resolve_selector(
-            connection, "JEENE_MASTER", "uid", _selector(exclude_seen=True)
+            connection, "JEENE_MASTER", "uid", _selector(exclude_seen=True), "neet"
         )
     )
     order = connection.calls[0][0].split("ORDER BY")[1]
@@ -227,7 +231,7 @@ def test_excluding_seen_questions_tops_up_with_the_oldest_rather_than_giving_up(
 
 def test_not_excluding_seen_leaves_the_ordering_alone():
     connection = _FakeConnection()
-    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector()))
+    asyncio.run(resolve_selector(connection, "JEENE_MASTER", "uid", _selector(), "neet"))
     assert "last_seen" not in connection.calls[0][0].split("ORDER BY")[1]
 
 
@@ -239,7 +243,7 @@ def test_an_item_that_is_already_frozen_is_not_resolved_again():
     connection = _FakeConnection()
     frozen = ["q1", "q2", "q3"]
     got = asyncio.run(
-        freeze_item(connection, "JEENE_MASTER", "uid", _item(resolved_question_ids=frozen))
+        freeze_item(connection, "JEENE_MASTER", "uid", _item(resolved_question_ids=frozen), "neet")
     )
     assert got == frozen
     assert connection.calls == [], "a frozen item must not touch the database"
@@ -250,7 +254,7 @@ def test_freezing_writes_the_resolved_ids_back_exactly_once():
         rows=[{"question_id": "q1"}, {"question_id": "q2"}],
         values=[["q1", "q2"]],
     )
-    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item()))
+    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item(), "neet"))
     assert got == ["q1", "q2"]
     update = connection.calls[1][0]
     assert "UPDATE study_plan_step_items" in update
@@ -264,14 +268,14 @@ def test_losing_the_freeze_race_returns_the_winners_deck_not_your_own():
         # The conditional UPDATE matches nothing: somebody else got there first.
         values=[None, ["theirs1", "theirs2"]],
     )
-    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item()))
+    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item(), "neet"))
     assert got == ["theirs1", "theirs2"]
 
 
 def test_a_selector_that_finds_nothing_is_not_frozen_empty():
     """A scope unpublished for a moment must not permanently empty a step."""
     connection = _FakeConnection(rows=[])
-    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item()))
+    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item(), "neet"))
     assert got == []
     assert not any("UPDATE" in call[0] for call in connection.calls)
 
@@ -282,7 +286,7 @@ def test_under_supply_freezes_what_exists_rather_than_failing():
         rows=[{"question_id": f"q{i}"} for i in range(3)],
         values=[["q0", "q1", "q2"]],
     )
-    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item(sel_count=8)))
+    got = asyncio.run(freeze_item(connection, "JEENE_MASTER", "uid", _item(sel_count=8), "neet"))
     assert got == ["q0", "q1", "q2"]
 
 

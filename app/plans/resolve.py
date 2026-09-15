@@ -28,7 +28,7 @@ import logging
 import asyncpg
 
 from app.plans.schema import QuestionSelector
-from app.visibility import NOT_UNRELEASED_TEST_SQL
+from app.visibility import NOT_UNRELEASED_TEST_SQL, exam_scope_sql
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ def _resolution_query(
     tenant: str,
     firebase_uid: str | None,
     salt: str,
+    exam_track: str | None,
 ) -> tuple[str, list]:
     """Build the query for this selector's shape, and the arguments that go with it.
 
@@ -120,6 +121,12 @@ def _resolution_query(
     ]
     if _SALT_PLACEHOLDER in order:
         args.append(salt)
+    # Appended after the salt, and its placeholder numbered from the finished list, so
+    # that the one conditional argument in this builder cannot shift it. The salt owns
+    # $8 when the ordering is `mixed` and nothing when it is not; hard-coding a number
+    # here would collide on exactly one of the three orderings.
+    args.append(exam_track)
+    exam_param = len(args)
     if selector.exclude_seen:
         # Unseen first, then the ones seen longest ago. A step that asked for ten unseen
         # questions in a scope with six left should still hand over ten — the four it
@@ -157,6 +164,7 @@ def _resolution_query(
                AND ($5::text[] IS NULL OR q.difficulty = ANY($5::text[])
                     OR ($6::bool AND q.difficulty IS NULL))
                {NOT_UNRELEASED_TEST_SQL}
+               {exam_scope_sql(exam_param)}
         )
         SELECT question_id FROM candidates q
          ORDER BY {order}
@@ -171,6 +179,7 @@ async def resolve_selector(
     tenant: str,
     firebase_uid: str | None,
     selector: QuestionSelector,
+    exam_track: str | None,
     salt: str = "",
 ) -> list[str]:
     """The questions this selector describes, in the order the step should show them.
@@ -178,11 +187,17 @@ async def resolve_selector(
     `salt` varies which slice of an over-large pool comes back, without making the result
     unrepeatable. `freeze_item` passes the item id; a caller previewing a selector can
     leave it empty and get a stable answer.
+
+    `exam_track` is passed in rather than looked up. A plan freezes many items in one
+    request, and resolving the student's exam inside here would be one extra round trip
+    per selector for an answer that cannot change within a request. It has no default
+    because a step freezes its questions once: a question from the wrong exam that got
+    in would be frozen into the step and replayed on every later open.
     """
     if not selector.concept_node_ids or selector.count <= 0:
         return []
 
-    sql, args = _resolution_query(selector, tenant, firebase_uid, salt)
+    sql, args = _resolution_query(selector, tenant, firebase_uid, salt, exam_track)
     rows = await connection.fetch(sql, *args)
     return [r["question_id"] for r in rows]
 
@@ -192,6 +207,7 @@ async def freeze_item(
     tenant: str,
     firebase_uid: str | None,
     item: asyncpg.Record | dict,
+    exam_track: str | None,
 ) -> list[str]:
     """The frozen question list for this item, resolving it the first time only.
 
@@ -209,7 +225,7 @@ async def freeze_item(
         return []
 
     resolved = await resolve_selector(
-        connection, tenant, firebase_uid, selector, salt=_item_id(item)
+        connection, tenant, firebase_uid, selector, exam_track, salt=_item_id(item)
     )
     if not resolved:
         # Nothing matched. Deliberately not written back: the scope may simply have been

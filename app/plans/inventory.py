@@ -47,7 +47,11 @@ from app.plans.schema import (
     VideoItem,
 )
 from app.plans.scope import ResolvedScope
-from app.visibility import NOT_UNRELEASED_TEST_SQL
+from app.visibility import (
+    NOT_UNRELEASED_TEST_SQL,
+    exam_scope_sql,
+    resolve_exam_track,
+)
 
 # Columns that must never appear in a query in this module. Read by the test, so this
 # tuple is the executable form of the rule rather than a comment about it.
@@ -119,6 +123,7 @@ _BUCKETS_SQL = f"""
        AND q.status = 'published'
        AND m.concept_node_id = ANY($2::text[])
        {NOT_UNRELEASED_TEST_SQL}
+       {exam_scope_sql(4)}
      GROUP BY m.concept_node_id, q.question_type, COALESCE(q.difficulty, 'unrated')
      ORDER BY m.concept_node_id, q.question_type, 3
 """
@@ -343,7 +348,13 @@ async def _buckets(
     if not concept_ids:
         return [], InventoryRollup()
 
-    rows = await connection.fetch(_BUCKETS_SQL, tenant, concept_ids, firebase_uid)
+    # The planner must not plan around a question the student will never be shown:
+    # an inventory that counts a JEE question towards a NEET student's coverage makes
+    # a step that can never be completed.
+    track = await resolve_exam_track(connection, tenant, firebase_uid)
+    rows = await connection.fetch(
+        _BUCKETS_SQL, tenant, concept_ids, firebase_uid, track
+    )
     buckets = [
         QuestionBucket(
             node_id=r["node_id"],

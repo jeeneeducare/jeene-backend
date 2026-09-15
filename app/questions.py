@@ -17,7 +17,7 @@ import asyncpg
 
 from app.figures import fetch_figures
 from app.schemas import Question
-from app.visibility import NOT_UNRELEASED_TEST_SQL
+from app.visibility import NOT_UNRELEASED_TEST_SQL, exam_scope_sql
 
 # Named columns, and the answer-bearing ones are conspicuously absent. Same discipline as
 # `app/plans/inventory.py`, for a different reader: that one keeps content from a model,
@@ -32,11 +32,15 @@ _BY_IDS_SQL = f"""
        AND q.question_id = ANY($2::text[])
        AND q.status = 'published'
        {NOT_UNRELEASED_TEST_SQL}
+       {exam_scope_sql(3)}
 """
 
 
 async def fetch_questions_by_ids(
-    connection: asyncpg.Connection, tenant: str, question_ids: list[str]
+    connection: asyncpg.Connection,
+    tenant: str,
+    question_ids: list[str],
+    exam_track: str | None,
 ) -> list[Question]:
     """These questions, in the order asked for, skipping any that no longer qualify.
 
@@ -44,14 +48,19 @@ async def fetch_questions_by_ids(
     deliberate spread — and returning them in database order would quietly discard the
     only sequencing decision the plan made.
 
-    A question that has since been unpublished, or that has been pulled into an unreleased
-    paper, simply does not come back. The step then shows fewer questions than its frozen
-    list, which is the honest outcome: the alternative is a card that opens on nothing.
+    A question that has since been unpublished, that has been pulled into an unreleased
+    paper, or that belongs to an exam this student is not sitting, simply does not come
+    back. The step then shows fewer questions than its frozen list, which is the honest
+    outcome: the alternative is a card that opens on nothing.
+
+    `exam_track` has no default on purpose. A frozen list is the one place an out-of-exam
+    question is most likely to survive — it was chosen once and is replayed thereafter —
+    so every caller is made to say which student is reading.
     """
     if not question_ids:
         return []
 
-    rows = await connection.fetch(_BY_IDS_SQL, tenant, question_ids)
+    rows = await connection.fetch(_BY_IDS_SQL, tenant, question_ids, exam_track)
     figures = await fetch_figures(connection, [r["question_id"] for r in rows])
     by_id = {
         r["question_id"]: Question(

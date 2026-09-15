@@ -33,6 +33,7 @@ import asyncpg
 
 from app import notes_text
 from app.plans.lookup import normalise
+from app.visibility import exam_scope_sql, resolve_exam_track
 
 logger = logging.getLogger(__name__)
 
@@ -317,17 +318,19 @@ SELECT question_id, question_text, options_json, correct_option_ids, explanation
      WHERE q.tenant_id = $1 AND q.status = 'published'
        AND q.explanation_json IS NOT NULL
        AND m.concept_node_id = ANY($2::text[])
+       {exam_scope}
      ORDER BY q.question_id, rank
   ) best
  ORDER BY rank, question_id
  LIMIT $3
-"""
+""".format(exam_scope=exam_scope_sql(4))
 
 _ONE_SOLUTION = """
-SELECT question_id, question_text, options_json, correct_option_ids, explanation_json
-  FROM questions
- WHERE question_id = $1 AND tenant_id = $2 AND status = 'published'
-"""
+SELECT q.question_id, q.question_text, q.options_json, q.correct_option_ids,
+       q.explanation_json
+  FROM questions q
+ WHERE q.question_id = $1 AND q.tenant_id = $2 AND q.status = 'published'
+""" + exam_scope_sql(3)
 
 # One row per question, not one per mapping. A question is usually mapped to several
 # concepts, and the obvious join returns it once for each — so a student who answered two
@@ -362,8 +365,13 @@ async def gather(
     The student's words are used only to *rank* material inside the anchor, never to
     search outside it. That is deliberate: a doubt about gravitation that happens to use
     the word "field" must not drag in electrostatics.
+
+    Solutions are scoped to the student's exam for the same reason the practice deck is.
+    Jeene quoting a JEE Main question's working at a NEET student would be the leak the
+    deck now prevents, arriving by a different door and wearing Jeene's voice.
     """
     material = Material(anchor=anchor)
+    exam_track = await resolve_exam_track(connection, tenant, uid)
 
     concepts = await connection.fetch(
         _CONCEPTS_UNDER, anchor.scope_node_id, tenant, MAX_CONCEPTS
@@ -378,7 +386,9 @@ async def gather(
     material.notes = await notes_text.text_for(connection, anchor.chapter_id, tenant)
 
     if anchor.kind == "question":
-        row = await connection.fetchrow(_ONE_SOLUTION, anchor.anchor_id, tenant)
+        row = await connection.fetchrow(
+            _ONE_SOLUTION, anchor.anchor_id, tenant, exam_track
+        )
         material.focus = _as_solution(row) if row else None
 
     # Ranked once and used twice: the concepts are re-ordered so the prompt reads the
@@ -389,7 +399,7 @@ async def gather(
         material.concepts = [by_id[node_id] for node_id in ranked]
 
         rows = await connection.fetch(
-            _SOLUTIONS_FOR, tenant, ranked, MAX_SOLUTIONS
+            _SOLUTIONS_FOR, tenant, ranked, MAX_SOLUTIONS, exam_track
         )
         focus_id = material.focus.question_id if material.focus else None
         material.solutions = [

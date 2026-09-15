@@ -46,6 +46,7 @@ from app.plans.scope import SCOPE_TYPES, resolve_scope
 from app.plans.resolve import resolve_selector
 from app.providers.openai_provider import build_provider
 from app.questions import fetch_questions_by_ids
+from app.visibility import resolve_exam_track
 from app.schemas import (
     CheckpointResult,
     Question,
@@ -111,6 +112,7 @@ async def placement_check(
     scope = await resolve_scope(connection, node_id, tenant)
     if scope is None:
         raise HTTPException(status_code=404, detail=_no_scope(node_id))
+    track = await resolve_exam_track(connection, tenant, user["uid"])
     ids = await resolve_selector(
         connection,
         tenant,
@@ -121,9 +123,10 @@ async def placement_check(
             order="easiest_first",
             exclude_seen=True,
         ),
+        track,
         salt=node_id,
     )
-    return await fetch_questions_by_ids(connection, tenant, ids)
+    return await fetch_questions_by_ids(connection, tenant, ids, track)
 
 
 @router.get("/scopes", response_model=list[ScopeMatch])
@@ -341,8 +344,11 @@ async def get_plan(
         None,
     )
     if current is not None:
+        # Resolved once for the whole freeze: the student's exam cannot change part-way
+        # through a request, and this runs once per item.
+        track = await resolve_exam_track(connection, tenant, user["uid"])
         for item in items_by_step.get(current["step_id"], []):
-            await freeze_item(connection, tenant, user["uid"], item)
+            await freeze_item(connection, tenant, user["uid"], item, track)
         items_by_step[current["step_id"]] = await store.items_for(
             connection, [current["step_id"]]
         )
@@ -392,8 +398,9 @@ async def step_items(
     """
     step = await _owned_step(connection, plan_id, step_id, user["uid"])
     items = await store.items_for(connection, [step["step_id"]])
+    track = await resolve_exam_track(connection, tenant, user["uid"])
     for item in items:
-        await freeze_item(connection, tenant, user["uid"], item)
+        await freeze_item(connection, tenant, user["uid"], item, track)
     items = await store.items_for(connection, [step["step_id"]])
 
     question_ids = _frozen_ids(items)
@@ -408,7 +415,9 @@ async def step_items(
     return StepItems(
         step_id=str(step["step_id"]),
         items=[_item(i, request) for i in items],
-        questions=await fetch_questions_by_ids(connection, tenant, question_ids),
+        questions=await fetch_questions_by_ids(
+            connection, tenant, question_ids, track
+        ),
     )
 
 

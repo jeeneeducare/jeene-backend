@@ -10,7 +10,11 @@ from app.db import get_connection
 from app.figures import fetch_figures
 from app.plans.resolve import difficulty_filter
 from app.questions import fetch_questions_by_ids
-from app.visibility import NOT_UNRELEASED_TEST_SQL
+from app.visibility import (
+    NOT_UNRELEASED_TEST_SQL,
+    exam_scope_sql,
+    resolve_exam_track,
+)
 from app.schemas import (
     QuestionExplanation,
     Chapter,
@@ -103,7 +107,10 @@ async def list_chapter_questions(
     if not rows:
         raise HTTPException(status_code=404, detail=f"Chapter '{chapter_id}' not found")
     node_ids = [r["node_id"] for r in rows]
-    return await _paginated_questions_for_node_ids(connection, node_ids, limit, offset, tenant)
+    track = await resolve_exam_track(connection, tenant, None)
+    return await _paginated_questions_for_node_ids(
+        connection, node_ids, limit, offset, tenant, track
+    )
 
 
 # What `difficulty` accepts. `unrated` is not a value in the column — it is the name
@@ -444,6 +451,7 @@ async def list_concept_questions(
         limit,
         offset,
         tenant,
+        await resolve_exam_track(connection, tenant, (user or {}).get("uid")),
         difficulty=difficulty,
         # A signed-out caller has no history, so the flag is simply nothing to apply
         # rather than an error — the practice deck is open to anonymous browsing.
@@ -490,14 +498,16 @@ async def get_questions_by_ids(
         ids,
     )
     permitted = set(allowed or [])
+    track = await resolve_exam_track(connection, tenant, user["uid"])
     return await fetch_questions_by_ids(
-        connection, tenant, [q for q in ids if q in permitted]
+        connection, tenant, [q for q in ids if q in permitted], track
     )
 
 
 @router.get("/questions/{question_id}", response_model=Question)
 async def get_question(
     question_id: str,
+    user: dict | None = Depends(optional_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> Question:
@@ -509,9 +519,10 @@ async def get_question(
                  WHERE m.question_id = q.question_id) AS concept_ids
         FROM questions q
         WHERE q.tenant_id = $1 AND q.question_id = $2 AND q.status = 'published'
-        """ + _NOT_UNRELEASED_TEST,
+        """ + _NOT_UNRELEASED_TEST + exam_scope_sql(3),
         tenant,
         question_id,
+        await resolve_exam_track(connection, tenant, (user or {}).get("uid")),
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Question '{question_id}' not found")
@@ -544,9 +555,10 @@ async def get_question_explanation(
         JOIN questions q ON q.question_id = e.question_id
         WHERE q.tenant_id = $1 AND q.question_id = $2
           AND q.status = 'published' AND e.status = 'published'
-        """ + _NOT_UNRELEASED_TEST,
+        """ + _NOT_UNRELEASED_TEST + exam_scope_sql(3),
         tenant,
         question_id,
+        await resolve_exam_track(connection, tenant, user["uid"]),
     )
     if row is None:
         # Absent rather than empty: most questions will not have one for a while, and
@@ -596,9 +608,10 @@ async def get_question_answer(
         SELECT q.question_id, q.correct_option_ids, q.explanation_json
         FROM questions q
         WHERE q.tenant_id = $1 AND q.question_id = $2 AND q.status = 'published'
-        """ + _NOT_UNRELEASED_TEST,
+        """ + _NOT_UNRELEASED_TEST + exam_scope_sql(3),
         tenant,
         question_id,
+        await resolve_exam_track(connection, tenant, user["uid"]),
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Question '{question_id}' not found")
@@ -670,6 +683,7 @@ async def _paginated_questions_for_node_ids(
     limit: int,
     offset: int,
     tenant: str,
+    exam_track: str | None,
     difficulty: list[str] | None = None,
     exclude_seen_for: str | None = None,
 ) -> PaginatedQuestions:
@@ -679,20 +693,25 @@ async def _paginated_questions_for_node_ids(
     on these concepts that this student has not met". Both default to off, so the two
     existing callers behave exactly as they did.
 
+    `exam_track` is not optional, because this is the deck: it is where a question from
+    the wrong exam would be met first and most often.
+
     `difficulty` may include `unrated`, which is not a value in the column but the name
     the planner uses for a question the pipeline has not graded — so it is translated to
     an IS NULL here rather than compared as a string.
     """
     graded, allow_unrated = difficulty_filter(difficulty or [])
     # Written once and shared by the count and the page, because a total that disagrees
-    # with the rows underneath it is worse than no total.
+    # with the rows underneath it is worse than no total. $6 is the exam track rather
+    # than the limit so that both queries can share this block: the count stops at $6,
+    # and only the page goes on to take a limit and an offset.
     filters = """
           AND ($3::text[] IS NULL OR q.difficulty = ANY($3::text[])
                OR ($4::bool AND q.difficulty IS NULL))
           AND ($5::text IS NULL OR NOT EXISTS (
                 SELECT 1 FROM attempts a
                  WHERE a.question_id = q.question_id AND a.firebase_uid = $5))
-    """
+    """ + exam_scope_sql(6)
     total = await connection.fetchval(
         """
         SELECT COUNT(DISTINCT q.question_id)
@@ -705,6 +724,7 @@ async def _paginated_questions_for_node_ids(
         graded,
         allow_unrated,
         exclude_seen_for,
+        exam_track,
     )
     rows = await connection.fetch(
         """
@@ -717,13 +737,14 @@ async def _paginated_questions_for_node_ids(
         WHERE q.tenant_id = $1 AND q.status = 'published' AND qcm.concept_node_id = ANY($2::text[])
         """ + _NOT_UNRELEASED_TEST + filters + """
         ORDER BY q.question_id
-        LIMIT $6 OFFSET $7
+        LIMIT $7 OFFSET $8
         """,
         tenant,
         node_ids,
         graded,
         allow_unrated,
         exclude_seen_for,
+        exam_track,
         limit,
         offset,
     )
