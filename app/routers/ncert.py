@@ -61,6 +61,10 @@ _DOCUMENT_SQL = """
 # Every highlight of a document with every question of it this reader may meet. A
 # highlight none of whose questions survive the filters has no row here, and so is not
 # shown. $3 is the reader's exam track.
+#
+# In reading order: page by page, and on a page down the left column before the right,
+# because NCERT is set in two columns and "next line" should mean the next one a reader
+# would reach, not whichever starts a little higher across the gutter.
 _VISIBLE_LINKS_SQL = f"""
     SELECT h.highlight_id, h.rects, h.quote, h.section, h.first_page, h.top,
            q.question_id, q.question_type, q.pyq_exam, q.pyq_year
@@ -71,7 +75,8 @@ _VISIBLE_LINKS_SQL = f"""
        AND q.tenant_id = $2 AND q.status = 'published'
        {NOT_UNRELEASED_TEST_SQL}
        {exam_scope_sql(3)}
-     ORDER BY h.first_page, h.top, h.highlight_id, q.question_id
+     ORDER BY h.first_page, (h.rects->0->>'x0')::float >= 0.5, h.top, h.highlight_id,
+              q.question_id
 """
 
 

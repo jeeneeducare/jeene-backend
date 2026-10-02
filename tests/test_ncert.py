@@ -111,6 +111,8 @@ HIGHLIGHTS = {
     "nh_test_dated_ar": ("published", 1, 0.30, ["ncert_t_ar_neet_2022", "ncert_t_pyq_undated"]),
     "nh_test_draft": ("draft", 1, 0.60, ["ncert_t_mcq_hard"]),
 }
+# Set in the right-hand column: higher on its page than the dated line, read after it.
+RIGHT_COLUMN = {"nh_test_practice"}
 
 
 async def _clean(connection):
@@ -155,7 +157,8 @@ async def _build():
             DOC, CHAPTER, "f" * 64, STORAGE_URL, json.dumps([page, page]),
         )
         for hid, (status, page_no, top, questions) in HIGHLIGHTS.items():
-            rects = [{"page": page_no, "x0": 0.1, "y0": top, "x1": 0.8, "y1": top + 0.015}]
+            x0, x1 = (0.52, 0.86) if hid in RIGHT_COLUMN else (0.1, 0.48)
+            rects = [{"page": page_no, "x0": x0, "y0": top, "x1": x1, "y1": top + 0.015}]
             await connection.execute(
                 """
                 INSERT INTO ncert_highlights (highlight_id, doc_id, rects, quote, section,
@@ -248,9 +251,10 @@ def test_a_neet_student_sees_the_lines_their_questions_came_from(client):
     body = response.json()
 
     # Reading order, and only what this reader may open: the JEE-only line and the draft
-    # line are not there at all.
+    # line are not there at all. On page 1 the left column comes first, so the dated line
+    # is before the practice one although the practice one starts higher up the page.
     assert [h["highlight_id"] for h in body["highlights"]] == [
-        "nh_test_mixed", "nh_test_practice", "nh_test_dated_ar"]
+        "nh_test_mixed", "nh_test_dated_ar", "nh_test_practice"]
     by_id = _by_id(body)
 
     mixed = by_id["nh_test_mixed"]
