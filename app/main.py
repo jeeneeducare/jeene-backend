@@ -17,6 +17,7 @@ from app.routers import (
     health,
     internal,
     mistakes,
+    ncert,
     notes,
     plans,
     reports,
@@ -54,6 +55,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(content.router)
 app.include_router(notes.router)
+app.include_router(ncert.router)
 app.include_router(auth.router)
 app.include_router(attempts.router)
 app.include_router(tests.router)

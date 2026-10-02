@@ -458,6 +458,84 @@ class ChapterNotes(BaseModel):
     size_bytes: int | None = None
 
 
+class NcertRect(BaseModel):
+    """One printed line of a highlight, in 0..1 of its page's CropBox, top-left origin.
+
+    The box every PDF viewer shows, not the MediaBox: the books carry a 27pt print bleed,
+    and coordinates measured against the larger box draw half a line high.
+    """
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class NcertPage(BaseModel):
+    #: The page's CropBox in points, so a reader can lay pages out before rendering any.
+    w: float
+    h: float
+    #: Left and right edge of the page's main text column, 0..1 of its width: what the
+    #: reader zooms to so the text is readable on a phone.
+    column: list[float]
+
+
+class NcertHighlight(BaseModel):
+    """A line of the chapter's NCERT that questions came from, as this reader may see it.
+
+    `kind`, `years` and `question_count` are worked out per request from the questions
+    this reader is allowed to meet — never stored — so a draft question, an unreleased
+    paper or another exam's past paper can never put a chip in front of the wrong student.
+    """
+    highlight_id: str
+    #: "pyq" when at least one of its questions is a past-year question, else "practice".
+    kind: str
+    #: "NEET 2019", newest first. Empty when the questions carry no year.
+    years: list[str] = []
+    question_count: int
+    #: This student's latest attempt on each question: how many are answered, and how
+    #: many of those correctly. Zero when signed out.
+    answered: int = 0
+    correct: int = 0
+    #: Reading order: the page and the height its first line starts at.
+    first_page: int
+    top: float
+    rects: list[NcertRect]
+    #: The highlighted text, for a list of the chapter's highlights and for accessibility.
+    quote: str
+    section: str | None = None
+
+
+class ChapterNcert(BaseModel):
+    """A chapter's NCERT, marked with the lines its questions came from.
+
+    The storage URL is not here, for the reason the notes give: it is durable,
+    unauthenticated and shareable. `file_url` is a signed, short-lived link back to this
+    API. `sha256` names the printing, so an app can keep the file and open it offline.
+    """
+    doc_id: str
+    chapter_id: str
+    sha256: str
+    page_count: int
+    pages: list[NcertPage]
+    file_url: str
+    highlights: list[NcertHighlight]
+
+
+class NcertDeck(BaseModel):
+    """The questions behind one highlight, without their answers.
+
+    Past-year questions first, newest first, then the rest from easy to hard. Answering
+    goes through `POST /attempts` like any other practice, daily allowance and all.
+    """
+    highlight_id: str
+    chapter_id: str
+    quote: str
+    questions: list[Question]
+    #: "NEET 2019" for each past-year question that carries a year, by question id.
+    labels: dict[str, str] = {}
+
+
 class ChapterVideo(BaseModel):
     """One curated YouTube lecture for a chapter.
 

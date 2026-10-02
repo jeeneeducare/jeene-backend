@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
 
@@ -92,3 +93,64 @@ def check_storage_url(url: str) -> None:
         if not address.is_global:
             logger.error("Notes storage host %r resolves to %s", host, address)
             raise HTTPException(status_code=502, detail=STORAGE_REFUSED)
+
+
+#: Streaming chunk. Large enough not to thrash, small enough that a slow reader does not
+#: hold a big buffer per connection.
+_CHUNK = 64 * 1024
+
+
+async def stream_document(url: str, *, what: str, cache_control: str) -> StreamingResponse:
+    """A PDF from storage, relayed through this process so the caller never learns where
+    it lives.
+
+    The notes route grew this logic first and is tested line by line where it stands, so
+    it keeps its own copy; the NCERT reader is the second caller and the first to use this
+    one. The rules are the notes route's, each paid for once already:
+
+      * the URL is checked before anything is fetched (`check_storage_url`);
+      * redirects are off, because a 302 from an allowed host is how an allowed URL turns
+        into a fetch of something else;
+      * nothing past `MAX_BYTES` is relayed, and nothing past the length upstream declared
+        either, so a response can never promise more bytes than it sends.
+    """
+    check_storage_url(url)
+
+    client = httpx.AsyncClient(timeout=STORAGE_TIMEOUT, follow_redirects=False)
+    try:
+        upstream = await client.send(client.build_request("GET", url), stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=STORAGE_REFUSED) from exc
+    if upstream.status_code != 200:
+        await upstream.aclose()
+        await client.aclose()
+        logger.error("Storage answered %s for %s", upstream.status_code, what)
+        raise HTTPException(status_code=502, detail=STORAGE_REFUSED)
+
+    declared = upstream.headers.get("content-length")
+    promised = int(declared) if declared and declared.isdigit() else None
+    if promised is not None and promised > MAX_BYTES:
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=STORAGE_REFUSED)
+    limit = promised if promised is not None else MAX_BYTES
+
+    async def body():
+        sent = 0
+        try:
+            async for chunk in upstream.aiter_bytes(_CHUNK):
+                if sent + len(chunk) > limit:
+                    logger.error("%s sent more than %d bytes; stopping", what, limit)
+                    yield chunk[: limit - sent]
+                    return
+                sent += len(chunk)
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    headers = {"Cache-Control": cache_control}
+    if promised is not None:
+        headers["Content-Length"] = str(promised)
+    return StreamingResponse(body(), media_type="application/pdf", headers=headers)
