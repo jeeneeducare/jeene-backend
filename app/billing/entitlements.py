@@ -2,8 +2,9 @@
 
 The ledger is the truth. `entitlement_grants` is append-only, and access is derived by
 folding those grants in order — never a mutable expiry column that some code path edits.
-That choice is what makes the four confirmation paths in the payments flow safe: a
-webhook delivered twice, a reconciler racing a client verify, a retry after a timeout.
+That choice is what makes the several confirmation paths of a purchase safe: a store
+notification delivered twice, the reconciler racing the app's own report, a retry after a
+timeout.
 Each tries to insert a grant, the unique index on `order_id` refuses the second, and the
 answer is the same either way.
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import asyncpg
 
@@ -163,23 +165,25 @@ async def grant(
     days: int,
     provider: str,
     order_id: str | None = None,
+    purchase_id: UUID | None = None,
     tier: str = PRO,
     note: str = "",
 ) -> bool:
     """Add days to a student's access. Returns whether this call was the one that did it.
 
-    Idempotent on `order_id`: the unique index refuses a second grant for the same
-    payment, and `ON CONFLICT DO NOTHING` turns that refusal into a False rather than an
-    exception. Two confirmation paths racing therefore produce one grant, decided by the
-    database rather than by whichever coroutine happened to be scheduled first.
+    Idempotent on `order_id` for a Razorpay payment and on `purchase_id` for a store
+    purchase: a unique index refuses a second grant for either, and `ON CONFLICT DO
+    NOTHING` turns that refusal into a False rather than an exception. Two confirmation
+    paths racing therefore produce one grant, decided by the database rather than by
+    whichever coroutine happened to be scheduled first.
 
-    Call inside a transaction with the payment row locked. The cache refresh below is
+    Call inside a transaction with the purchase row locked. The cache refresh below is
     part of that same transaction, so there is no window in which the ledger and the
     cache disagree.
 
-    **The student's row is taken first, before the insert.** Two payments by the same
-    student settle against two *different* `payments` rows, so the lock in
-    [app.billing.settle.settle] does not serialise them against each other. Left alone,
+    **The student's row is taken first, before the insert.** Two purchases by the same
+    student are recorded against two *different* purchase rows, so the lock in
+    [app.billing.purchases.record] does not serialise them against each other. Left alone,
     both would insert a grant, both would fold a ledger that did not yet contain the
     other's, and the second write would land on top of the first — measured: two thirty-day
     passes bought together left the cache thirty days short of the ledger, and every gate
@@ -196,14 +200,76 @@ async def grant(
     inserted = await connection.fetchval(
         """
         INSERT INTO entitlement_grants
-               (firebase_uid, tenant_id, tier, days, provider, order_id, note)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (firebase_uid, tenant_id, tier, days, provider, order_id, purchase_id, note)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT DO NOTHING
         RETURNING grant_id
         """,
-        uid, tenant, tier, days, provider, order_id, note,
+        uid, tenant, tier, days, provider, order_id, purchase_id, note,
     )
     if inserted is None:
         return False
     await refresh_cache(connection, uid, tenant, tier)
+    return True
+
+
+async def current_link(connection: asyncpg.Connection, purchase_id: UUID) -> asyncpg.Record | None:
+    """The grant for this purchase that nothing has reversed yet, or None if it never had one.
+
+    A store purchase's grants form a chain: the grant, then a refund's reversal of it,
+    then — if Apple reverses the refund — a reversal of that reversal, and so on. Exactly
+    one link is unreversed at any moment, and its sign says where the purchase stands:
+    positive is "granted", negative is "taken back".
+
+    Found rather than stored, so there is no status column here that could disagree with
+    the rows it summarises.
+    """
+    return await connection.fetchrow(
+        """
+        SELECT g.grant_id, g.firebase_uid, g.tenant_id, g.tier, g.days, g.provider
+          FROM entitlement_grants g
+         WHERE g.purchase_id = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM entitlement_grants r WHERE r.reverses_grant_id = g.grant_id
+           )
+         ORDER BY g.granted_at DESC, g.grant_id
+         LIMIT 1
+        """,
+        purchase_id,
+    )
+
+
+async def reverse(
+    connection: asyncpg.Connection, link: asyncpg.Record, *, note: str = ""
+) -> bool:
+    """Cancel one grant by adding its opposite. Returns whether this call was the one that did it.
+
+    The ledger is never edited: a refund is a row of negative days, and Apple reversing
+    the refund is a row cancelling *that*. Both fold like any other grant — the refund
+    pulls the running expiry back by exactly what the purchase added — and both are
+    idempotent on `reverses_grant_id`, so a refund notification delivered twice takes the
+    days back once.
+
+    Call inside a transaction, as with [grant]; the student's row is taken first for the
+    same reason it is there.
+    """
+    await connection.fetchval(
+        "SELECT firebase_uid FROM users WHERE firebase_uid = $1 FOR UPDATE",
+        link["firebase_uid"],
+    )
+    inserted = await connection.fetchval(
+        """
+        INSERT INTO entitlement_grants
+               (firebase_uid, tenant_id, tier, days, provider, purchase_id,
+                reverses_grant_id, note)
+        SELECT firebase_uid, tenant_id, tier, -days, provider, purchase_id, grant_id, $2
+          FROM entitlement_grants WHERE grant_id = $1
+        ON CONFLICT DO NOTHING
+        RETURNING grant_id
+        """,
+        link["grant_id"], note,
+    )
+    if inserted is None:
+        return False
+    await refresh_cache(connection, link["firebase_uid"], link["tenant_id"], link["tier"])
     return True

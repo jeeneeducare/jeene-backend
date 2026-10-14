@@ -36,25 +36,49 @@ class Settings(BaseSettings):
     jeene_notes_storage_hosts: str | None = None
 
     # --- Billing ---------------------------------------------------------------------
-    #: Publishable. Reaches the app with every created order — it has to, the checkout
-    #: SDK needs it — and is useless on its own.
-    razorpay_key_id: str | None = None
-    #: Server only, for ever. It authenticates API calls *and* is the HMAC key that
-    #: proves a success callback came from Razorpay, so a leak is both a way to spend
-    #: from the account and a way to forge a purchase.
-    razorpay_key_secret: str | None = None
-    #: Server only. Signs webhook bodies; set from the Razorpay dashboard when the
-    #: endpoint is registered.
-    razorpay_webhook_secret: str | None = None
-    #: Server only. Signs price quotes. Rotating it invalidates outstanding quotes,
-    #: which is harmless — they live ten minutes.
-    jeene_quote_secret: str | None = None
-    #: Set to allow real charges. Left false, the gateway is never constructed and the
-    #: money routes answer 503, so a half-configured deployment cannot take a payment.
+    # Pro is sold through Google Play billing and Apple's in-app purchase. The stores take
+    # the money; these settings are what this backend needs to ask them whether a purchase
+    # is real. Each store is configured on its own, and a store with nothing set answers
+    # 503 on its routes rather than half-working.
+
+    #: Set to sell, and to lock what Pro unlocks: the two are one switch, so a student is
+    #: never shown a lock with no way through it. Left false, every store route answers
+    #: 503 and every gate passes.
     jeene_billing_enabled: bool = False
     #: Shared secret the reconciler cron presents. Not a user credential and never
-    #: reaches a client: the route it opens can settle payments.
+    #: reaches a client: the route it opens can grant access.
     jeene_reconcile_secret: str | None = None
+
+    #: The Android app's package name, as Play Console knows it.
+    google_play_package_name: str | None = None
+    #: Server only, for ever. The whole JSON key of the service account Play Console lets
+    #: read orders and consume purchases. A leak lets somebody refund and consume purchases
+    #: on the account, so it lives only in Render's environment.
+    google_play_service_account_json: str | None = None
+    #: The service account Pub/Sub signs its push tokens as, and the audience it signs
+    #: them for. Together they are the whole of the authentication on the notifications
+    #: route: a push that does not carry a token Google signed for exactly this pair is
+    #: refused.
+    google_pubsub_push_service_account: str | None = None
+    google_pubsub_push_audience: str | None = None
+
+    #: The iOS bundle id. Every signed transaction names one, and a transaction for any
+    #: other app is refused however good its signature.
+    apple_bundle_id: str | None = None
+    #: The app's numeric Apple ID (App Store Connect → App Information). Apple's library
+    #: requires it to accept a production transaction; without it only the test
+    #: environment verifies.
+    apple_app_id: int | None = None
+    #: The In-App Purchase key, for the App Store Server API (the reconciler reads missed
+    #: notifications through it). Optional: purchases verify without it, from Apple's
+    #: signature alone. The private key is server only, for ever.
+    apple_iap_key_id: str | None = None
+    apple_iap_issuer_id: str | None = None
+    apple_iap_private_key: str | None = None
+    #: Local development only. Xcode's StoreKit testing signs transactions with a local
+    #: certificate Apple never issued, so accepting them means accepting a signature
+    #: nobody checks. Never set on a deployment.
+    apple_accept_xcode_transactions: bool = False
 
 
 settings = Settings()

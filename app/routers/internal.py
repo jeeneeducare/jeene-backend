@@ -1,15 +1,14 @@
 """The sweeps nobody triggers. Cron reaches these; no student ever does.
 
-Two endpoints live here: the payment reconciler, the fourth and last of the
-confirmation paths. The other three all depend on something arriving — a client callback,
-a webhook, a failure report — and each has a way of not arriving. A phone dies on the
-success screen. A webhook is dropped, or lands while a deploy is restarting. A student
-force-quits mid-capture.
+Two endpoints live here: the purchase reconciler, the last of the confirmation paths. The
+other two depend on something arriving — the app handing a purchase over, a store's
+notification — and each has a way of not arriving. A phone dies between the store's
+sheet and its next request. A notification is dropped, or lands while a deploy is
+restarting. Google refunds a purchase nobody consumed within three days.
 
-The reconciler assumes none of that. It asks Razorpay directly about every payment still
-sitting at `pending`, which makes it the path that closes a purchase when every other one
-has failed, and the reason a student who paid always ends up with what they paid for
-even when the network did not cooperate.
+The reconciler assumes none of that arrived. It asks the stores directly, which makes it
+the path that closes a purchase when every other one has failed, and the reason a student
+who paid always ends up with what they paid for even when the network did not cooperate.
 
 The second is Ask Jeene's health, which grants nothing and is here because it wants the
 same lock and the same caller: something watching, on a schedule, with no user.
@@ -23,38 +22,45 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from app.billing import BillingUnavailable, gateway, settle
-from app.billing.gateway import constant_time_equals
+from app.billing import BillingUnavailable, app_store, google_play, purchases
+from app.billing.notifications import handle_apple
+from app.billing.stores import (
+    GOOGLE,
+    AppStore,
+    GooglePlay,
+    ProofRejected,
+    StoreUnreachable,
+)
 from app.config import settings
 from app.db import get_connection
 from app.doubts import answer as answer_module
 from app.schemas import DoubtHealth, ReconcileReport
+from app.security import constant_time_equals
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
-#: How long a payment is left alone before it is asked about. A checkout that is going to
-#: succeed usually has, and its own three confirmation paths get first refusal; sweeping
-#: at ten seconds would mean racing the student's own success callback for no gain.
-_GRACE_SECONDS = 300
+#: How long a purchase is left to its own paths before the sweep touches it. The request
+#: that granted a Google purchase consumes it a moment later, and racing it would only
+#: produce a second consume for Google to refuse.
+_GRACE_SECONDS = 120
 
-#: When a pending payment stops being "in flight" and starts being abandoned. Razorpay
-#: keeps an unpaid order open far longer than this, but a student who walked away half an
-#: hour ago should not be looking at "payment in progress" — they should be able to try
-#: again. Nothing is failed at this point without asking the gateway first.
-_GIVE_UP_SECONDS = 1800
+#: How far back refunds and Apple's undelivered notifications are read. Every step is
+#: idempotent, so reading the same three days every five minutes costs a request and
+#: changes nothing twice; the width is there so an outage of a day or two is still caught.
+_LOOKBACK = timedelta(days=3)
 
-#: One sweep's worth. Each row costs a call to Razorpay, and this holds a pooled
-#: connection while it runs; a backlog is finished by the next run five minutes later
-#: rather than by one run that monopolises a connection for a minute.
+#: One sweep's worth of rows per kind. Each costs a call to Google, and this holds a
+#: pooled connection while it runs; a backlog is finished by the next run.
 _BATCH = 25
 
-#: Wall-clock budget, so a gateway having a slow day cannot pin a connection for the full
+#: Wall-clock budget, so a store having a slow day cannot pin a connection for the full
 #: batch × timeout. Whatever is left is simply swept next time.
 _BUDGET_SECONDS = 45.0
 
@@ -74,134 +80,164 @@ def _authorise(presented: str) -> None:
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+def _configured(build) -> object | None:
+    try:
+        return build()
+    except BillingUnavailable:
+        return None
+
+
 @router.post("/billing/reconcile", response_model=ReconcileReport, include_in_schema=False)
 async def reconcile(
     x_jeene_reconcile: str = Header(default=""),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> ReconcileReport:
-    """Ask the gateway what happened to every payment we are still unsure about.
+    """Ask the stores about everything still unsettled, and catch what was missed.
 
-    The decision for each row is made from Razorpay's own list of attempts against the
-    order, never from elapsed time alone:
+    **Google**, three things:
 
-    **Captured** — money is in. Settled as paid, and access is granted here exactly as it
-    would have been by a webhook. This is the case that makes the reconciler worth having.
+      * granted purchases nobody has consumed yet are consumed — before Google's
+        three-day automatic refund of anything left unacknowledged;
+      * pending purchases are read again, and granted or cancelled as Google now says;
+      * the last three days of voided purchases are applied, for any refund whose
+        notification never arrived.
 
-    **Authorised but not captured** — money is held and not taken. Auto-capture is on, so
-    this should not persist; when it does, something is wrong that a timer cannot fix.
-    Routed to manual review rather than failed, because telling a student it failed while
-    their bank shows a hold is the worst of both answers.
+    **Apple**, one: the notifications Apple could not deliver in the last three days are
+    read back from its history and handled exactly as the route would have.
 
-    **Nothing, or only dead attempts** — failed, but only once the give-up window has
-    passed. Before that it stays pending: a student who is still typing an OTP has no
-    attempts against their order yet, and failing them mid-payment would be a bug that
-    only ever bites the people on slow connections.
+    A store that is not configured is skipped, not an error — one store can go live
+    before the other.
     """
     _authorise(x_jeene_reconcile)
 
-    # Billing switched off is a *configuration*, not a fault, and answering it with an
-    # error was wrong twice over. It made the cron fail every five minutes from the moment
-    # it was created until the day billing was turned on — which teaches whoever set it up
-    # to ignore a red run on the one job whose whole purpose is to be trusted when it
-    # complains. And it broke the rollback: switching billing off is the lever to pull when
-    # something is wrong at eleven at night, and pulling it would have started an alarm
-    # storm on top of whatever was already going on.
-    #
-    # There is genuinely nothing to sweep. Nothing can be sold, so nothing can be pending.
+    # Billing switched off is a *configuration*, not a fault. Answering it with an error
+    # made the cron fail every five minutes from the moment it was created until billing
+    # was turned on — which teaches whoever set it up to ignore a red run on the one job
+    # whose whole purpose is to be trusted when it complains. And switching billing off is
+    # the lever to pull when something is wrong at eleven at night; pulling it must not
+    # start an alarm storm on top of whatever was already going on.
     if not settings.jeene_billing_enabled:
         logger.info("reconcile: billing is switched off; nothing to sweep")
-        return ReconcileReport(status="disabled", examined=0, paid=0, failed=0,
-                               review=0, left_pending=0)
+        return ReconcileReport(status="disabled")
 
-    # Switched *on* with no credentials behind it is a different thing entirely: a
-    # deployment that believes it is selling and cannot confirm a payment. That still
+    google = _configured(google_play)
+    apple = _configured(app_store)
+    # Switched *on* with neither store behind it is a different thing entirely: a
+    # deployment that believes it is selling and cannot confirm a purchase. That still
     # fails loudly, because somebody has to find out.
-    try:
-        gw = gateway()
-    except BillingUnavailable as exc:
-        logger.error("reconcile: billing is enabled but has no gateway credentials")
-        raise HTTPException(status_code=503, detail="Payments are not configured") from exc
+    if google is None and apple is None:
+        logger.error("reconcile: billing is enabled but no store is configured")
+        raise HTTPException(status_code=503, detail="Payments are not configured")
 
-    rows = await connection.fetch(
+    report = ReconcileReport()
+    started = time.monotonic()
+    if google is not None:
+        await _sweep_google(connection, google, report, started)
+    if apple is not None:
+        await _sweep_apple(connection, apple, report, started)
+    return report
+
+
+def _out_of_time(started: float) -> bool:
+    return time.monotonic() - started > _BUDGET_SECONDS
+
+
+async def _sweep_google(
+    connection: asyncpg.Connection, client: GooglePlay, report: ReconcileReport, started: float
+) -> None:
+    unconsumed = await connection.fetch(
         """
-        SELECT order_id, EXTRACT(EPOCH FROM (now() - created_at))::bigint AS age_seconds
-          FROM payments
-         WHERE status = 'pending'
+        SELECT store_ref, store_product_id FROM store_purchases
+         WHERE store = 'google' AND status = 'granted' AND consumed_at IS NULL
            AND created_at < now() - make_interval(secs => $1)
          ORDER BY created_at
          LIMIT $2
         """,
         _GRACE_SECONDS, _BATCH,
     )
-
-    report = ReconcileReport(examined=0, paid=0, failed=0, review=0, left_pending=0)
-    started = time.monotonic()
-
-    for row in rows:
-        if time.monotonic() - started > _BUDGET_SECONDS:
-            logger.info("reconcile ran out of budget with %d rows left", len(rows) - report.examined)
-            break
-
-        order_id = row["order_id"]
-        report.examined += 1
-
+    for row in unconsumed:
+        if _out_of_time(started):
+            return
         try:
-            attempts = await gw.fetch_order_payments(order_id)
-        except Exception:  # noqa: BLE001 — one unreachable order must not end the sweep
-            logger.warning("reconcile could not reach the gateway for %s", order_id)
-            report.left_pending += 1
+            await client.consume(row["store_product_id"], row["store_ref"])
+        except (StoreUnreachable, ProofRejected):
+            logger.warning("reconcile could not consume %s", row["store_ref"][:12])
+            report.errors += 1
             continue
+        await purchases.mark_consumed(connection, row["store_ref"])
+        report.consumed += 1
 
-        captured = next((p for p in attempts if p.captured), None)
-        held = next((p for p in attempts if p.status == "authorized"), None)
-        expired = row["age_seconds"] >= _GIVE_UP_SECONDS
-
+    pending = await connection.fetch(
+        """
+        SELECT store_ref FROM store_purchases
+         WHERE store = 'google' AND status = 'pending'
+           AND created_at < now() - make_interval(secs => $1)
+         ORDER BY updated_at
+         LIMIT $2
+        """,
+        _GRACE_SECONDS, _BATCH,
+    )
+    for row in pending:
+        if _out_of_time(started):
+            return
         try:
-            if captured is not None:
-                outcome = await settle.settle(
-                    connection, order_id, to=settle.PAID,
-                    payment_id=captured.payment_id, payload=captured.raw,
-                    paid_paise=captured.amount_paise,
-                )
-                logger.info("reconcile settled %s as %s (granted=%s)",
-                            order_id, outcome.status, outcome.granted)
-                # Not necessarily paid: a short payment is sent to a person instead, and
-                # the count has to say what happened rather than what was asked for.
-                if outcome.status == settle.PAID:
-                    report.paid += 1
-                else:
-                    report.review += 1
+            purchase = await client.get_purchase(row["store_ref"])
+            owner = await purchases.owner_of(connection, purchase, handed_over_by=None)
+            if owner is None:  # pragma: no cover — a recorded purchase always has one
+                continue
+            outcome = await purchases.record(connection, purchase, owner)
+        except (StoreUnreachable, ProofRejected, purchases.UnknownAccount,
+                purchases.NotForSale) as exc:
+            logger.warning("reconcile could not settle a pending purchase: %s", exc)
+            report.errors += 1
+            continue
+        if outcome.status == purchases.GRANTED:
+            report.granted += 1
+            await purchases.consume_if_due(connection, client, purchase, outcome)
+        elif outcome.status == purchases.STATUS_CANCELLED:
+            report.cancelled += 1
+        else:
+            report.left_pending += 1
 
-            elif held is not None and expired:
-                await settle.settle(
-                    connection, order_id, to=settle.REVIEW,
-                    payment_id=held.payment_id,
-                    failure_reason="authorised but never captured",
-                    payload=held.raw,
-                )
-                logger.error("reconcile found %s authorised and uncaptured", order_id)
-                report.review += 1
+    if _out_of_time(started):
+        return
+    try:
+        voided = await client.voided_since(datetime.now(timezone.utc) - _LOOKBACK)
+    except (StoreUnreachable, ProofRejected) as exc:
+        logger.warning("reconcile could not read Google's voided purchases: %s", exc)
+        report.errors += 1
+        return
+    for item in voided:
+        if await purchases.void(connection, GOOGLE, item.purchase_token,
+                                voided_at=item.voided_at):
+            report.refunded += 1
 
-            elif expired:
-                dead = next((p for p in attempts if p.dead), None)
-                await settle.settle(
-                    connection, order_id, to=settle.FAILED,
-                    payment_id=dead.payment_id if dead else None,
-                    failure_reason=(dead.failure_reason if dead and dead.failure_reason
-                                    else "the payment was not completed"),
-                    payload=dead.raw if dead else None,
-                )
-                report.failed += 1
 
-            else:
-                report.left_pending += 1
-
-        except settle.UnknownOrder:
-            # Impossible — the id came out of this table a moment ago — but a sweep that
-            # dies on one row is a sweep that stops settling the rest.
-            logger.error("reconcile lost the payment row for %s", order_id)
-
-    return report
+async def _sweep_apple(
+    connection: asyncpg.Connection, store: AppStore, report: ReconcileReport, started: float
+) -> None:
+    if _out_of_time(started):
+        return
+    try:
+        payloads = await store.notification_history(datetime.now(timezone.utc) - _LOOKBACK)
+    except StoreUnreachable as exc:
+        logger.warning("reconcile could not read Apple's notification history: %s", exc)
+        report.errors += 1
+        return
+    for signed in payloads:
+        if _out_of_time(started):
+            return
+        try:
+            note = await store.verify_notification(signed)
+        except (StoreUnreachable, ProofRejected) as exc:
+            logger.warning("reconcile could not verify an Apple notification: %s", exc)
+            report.errors += 1
+            continue
+        result = await handle_apple(connection, note)
+        if result == purchases.GRANTED:
+            report.granted += 1
+        elif result == "refunded":
+            report.refunded += 1
 
 _HEALTH_SQL = """
 SELECT

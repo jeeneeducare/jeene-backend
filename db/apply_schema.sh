@@ -47,6 +47,22 @@ FROM (
        WHERE table_name = 'node_videos' AND column_name = 'duration_seconds')
   UNION ALL SELECT 'index uq_study_plans_active_scope',
       to_regclass('public.uq_study_plans_active_scope') IS NOT NULL
+  UNION ALL SELECT 'table store_purchases',       to_regclass('public.store_purchases')       IS NOT NULL
+  UNION ALL SELECT 'column google_product_id', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'products' AND column_name = 'google_product_id')
+  UNION ALL SELECT 'column apple_product_id', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'products' AND column_name = 'apple_product_id')
+  UNION ALL SELECT 'column store_account_token', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'users' AND column_name = 'store_account_token')
+  UNION ALL SELECT 'column purchase_id', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'entitlement_grants' AND column_name = 'purchase_id')
+  UNION ALL SELECT 'column reverses_grant_id', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'entitlement_grants' AND column_name = 'reverses_grant_id')
 ) t ORDER BY obj;
 SQL
 

@@ -490,6 +490,10 @@ CREATE INDEX IF NOT EXISTS idx_products_sellable
 
 -- One row per attempt to pay. Keyed by Razorpay's own order id so the two systems can
 -- never disagree about which record is which.
+--
+-- Historical since October 2026, when Pro moved to the app stores (`store_purchases`
+-- below). Nothing writes here any more; the rows stay because grants reference them and
+-- a receipt has to stay explainable.
 CREATE TABLE IF NOT EXISTS payments (
   order_id            TEXT PRIMARY KEY,
   firebase_uid        TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE RESTRICT,
@@ -546,6 +550,8 @@ CREATE TABLE IF NOT EXISTS entitlement_grants (
   days          INTEGER NOT NULL,
   -- 'razorpay' today; 'apple' or 'manual' later without a migration. This column is the
   -- seam that keeps a change of store from becoming a redesign of entitlements.
+  -- Since October 2026: 'google' and 'apple' for store purchases, 'manual' for support
+  -- and comps; 'razorpay' remains on the grants made before the move.
   provider      TEXT NOT NULL,
   -- Null for a comp or a support grant; set for anything paid.
   order_id      TEXT REFERENCES payments(order_id),
@@ -563,6 +569,100 @@ CREATE INDEX IF NOT EXISTS idx_grants_user
 -- stays the truth; this exists so the gate on a practice request is one indexed read
 -- rather than an aggregate. Null means "never had access".
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_expires_at TIMESTAMPTZ;
+
+
+-- ---------------------------------------------------------------------------
+-- Store billing (October 2026).
+--
+-- Pro is sold through Google Play billing on Android and Apple's in-app purchase on
+-- iPhone, as both stores require for digital content. The store takes the money; this
+-- backend checks every purchase with the store before granting anything, and keeps the
+-- same append-only ledger above as the only answer to "is this student Pro".
+-- ---------------------------------------------------------------------------
+
+-- Which store product is which pass. Null where a store does not sell it, and the paywall
+-- on that platform leaves it out. Unique, because a store purchase names its product by
+-- this id and has to resolve to exactly one pass.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS google_product_id TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS apple_product_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_google_product
+  ON products (google_product_id) WHERE google_product_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_apple_product
+  ON products (apple_product_id) WHERE apple_product_id IS NOT NULL;
+
+-- The private id both stores carry back with a purchase: Apple's `appAccountToken`,
+-- Google's `obfuscatedAccountId`. A UUID rather than the Firebase uid, so neither store
+-- ever holds an identifier that means anything outside this table. It is what credits a
+-- purchase to the account that made it even when it arrives by notification, or from a
+-- phone where somebody else has since signed in. Created the first time it is asked for.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS store_account_token UUID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_store_account_token
+  ON users (store_account_token) WHERE store_account_token IS NOT NULL;
+
+-- One row per store purchase, whichever path told us about it first: the app, a store
+-- notification, or the reconciler. `(store, store_ref)` is unique, and that one index is
+-- what makes all three safe to arrive twice, or together.
+CREATE TABLE IF NOT EXISTS store_purchases (
+  purchase_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  store             TEXT NOT NULL CHECK (store IN ('google', 'apple')),
+  -- Google's purchase token, or Apple's transaction id: the store's own unique handle on
+  -- this purchase, and the thing a refund later names.
+  store_ref         TEXT NOT NULL,
+  -- Google's order id (GPA.…) or Apple's original transaction id. For a person reading a
+  -- support email, not for joining on.
+  store_order_id    TEXT,
+  store_product_id  TEXT NOT NULL,
+  product_id        TEXT NOT NULL REFERENCES products(product_id),
+  firebase_uid      TEXT NOT NULL REFERENCES users(firebase_uid) ON DELETE RESTRICT,
+  tenant_id         TEXT NOT NULL REFERENCES tenants(tenant_id),
+  -- Copied at purchase and never re-read, for the same reason `payments` copies it: a
+  -- pass lengthened tomorrow must not change what somebody bought today.
+  duration_days     INTEGER NOT NULL CHECK (duration_days > 0),
+  -- 'sandbox' covers Apple's test environment, Xcode's StoreKit testing and Google's
+  -- license-tester purchases. They grant Pro like any other (Apple's reviewers buy this
+  -- way, against this backend), and are told apart here so revenue never counts them.
+  environment       TEXT NOT NULL CHECK (environment IN ('production', 'sandbox')),
+  status            TEXT NOT NULL
+                      CHECK (status IN ('pending', 'granted', 'cancelled', 'refunded')),
+  -- As the store reported it, when it does (Apple does; Google's purchase record does
+  -- not). Micros of the currency: ₹199 is 199000000.
+  price_micros      BIGINT,
+  currency          TEXT,
+  purchased_at      TIMESTAMPTZ,
+  -- Google only. A purchase nobody consumes within three days is refunded by Google on
+  -- its own, so this is what the reconciler watches.
+  consumed_at       TIMESTAMPTZ,
+  refunded_at       TIMESTAMPTZ,
+  -- What the store said, verbatim, for the day somebody disputes a charge.
+  store_payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_store_purchases_ref
+  ON store_purchases (store, store_ref);
+CREATE INDEX IF NOT EXISTS idx_store_purchases_user
+  ON store_purchases (firebase_uid, created_at DESC);
+-- The reconciler's two working sets.
+CREATE INDEX IF NOT EXISTS idx_store_purchases_unconsumed
+  ON store_purchases (created_at)
+  WHERE store = 'google' AND status = 'granted' AND consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_store_purchases_pending
+  ON store_purchases (created_at) WHERE status = 'pending';
+
+-- A grant for a store purchase names it, and a refund reverses that grant by naming it
+-- in turn. Both are unique, which is what makes a refund delivered twice take the days
+-- back once: one grant per purchase, one reversal per grant. Apple can reverse a refund,
+-- and that reverses the reversal — a chain whose last link says where the purchase stands.
+ALTER TABLE entitlement_grants
+  ADD COLUMN IF NOT EXISTS purchase_id UUID REFERENCES store_purchases(purchase_id);
+ALTER TABLE entitlement_grants
+  ADD COLUMN IF NOT EXISTS reverses_grant_id UUID REFERENCES entitlement_grants(grant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grant_per_purchase
+  ON entitlement_grants (purchase_id)
+  WHERE purchase_id IS NOT NULL AND reverses_grant_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_reversal_per_grant
+  ON entitlement_grants (reverses_grant_id) WHERE reverses_grant_id IS NOT NULL;
 
 
 -- =====================================================================================

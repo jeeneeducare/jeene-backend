@@ -1,153 +1,152 @@
-"""What Pro costs, buying it, and whether this student has it.
+"""What Pro costs, buying it from a store, and whether this student has it.
 
-Reads first — the catalogue and "am I Pro" — then the write path in the order a purchase
-travels it: quote, order, and the two confirmations an app can send.
+Pro is sold through Google Play billing on Android and Apple's in-app purchase on
+iPhone. The store shows the price, takes the money and hands the app a proof of
+purchase; this file is where that proof arrives and where the stores' own notifications
+arrive, and nothing in it grants anything until the store itself has confirmed it.
 
-Nothing in this file decides a payment's outcome by itself. Every route that ends a
-purchase hands off to [app.billing.settle], which is the only thing that writes
-`payments.status`, and which the webhook and the reconciler call on their own paths. That
-is what makes it safe for four things to confirm the same payment at once.
+Reads first — the catalogue and "am I Pro" — then the three ways a purchase reaches us:
 
-Three decisions worth knowing before reading:
+  * **`POST /billing/purchases`** — the app handing over a purchase it just completed,
+    or one it found unfinished at launch;
+  * **`POST /billing/google/notifications`** — Google, through Pub/Sub, about purchases
+    that complete later (a UPI payment) and purchases taken back;
+  * **`POST /billing/apple/notifications`** — Apple, about the same.
+
+All three hand off to [app.billing.purchases], which is the only thing that records a
+store purchase or grants one, and which the reconciler calls on its own path. That is
+what makes it safe for them to arrive twice, or together.
 
 **Products are public.** The paywall renders before sign-in, because a student deciding
-whether to make an account should be able to see what it would cost. The reply carries
-prices and durations and nothing about anybody.
+whether to make an account should be able to see what it would cost.
 
-**Prices are integers, all the way out.** `amount_paise` reaches the app as paise and is
-formatted at the very last moment, in the UI. No float touches a price on either side of
-the wire — the arithmetic that produces 119999.49999999999 on one runtime and 119999.5 on
-another has no place anywhere near a charge.
-
-**The client is never believed about money.** It reports what it saw — a success, a
-cancellation — and each report is checked against Razorpay before anything is written. A
-patched app can send whatever it likes to these routes and change nothing.
+**The client is never believed.** It hands over the store's proof and nothing else; the
+product, the account, whether it is paid and whether it was a test all come from the
+store's answer. A patched app can send whatever it likes here and grant itself nothing.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
-import secrets
 import time
 from collections import defaultdict
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from app.auth import current_tenant, optional_user, require_user
-from app.billing import BillingUnavailable, entitlements, gateway, quotes, settle
-from app.config import settings
+from app.auth import current_tenant, require_user
+from app.billing import BillingUnavailable, app_store, entitlements, google_play, purchases
+from app.billing.notifications import handle_apple, handle_google
+from app.billing.stores import GOOGLE, PENDING, ProofRejected, StoreUnreachable
 from app.db import get_connection
 from app.schemas import (
     EntitlementView,
-    FailureRequest,
-    OrderRequest,
-    OrderResponse,
     Product,
-    QuoteRequest,
-    QuoteResponse,
-    SettlementResponse,
-    VerifyRequest,
+    StorePurchaseRequest,
+    StorePurchaseResponse,
 )
 
 logger = logging.getLogger(__name__)
 
-#: Creating an order costs a call to Razorpay and writes a row. Neither is expensive, but
-#: an unbounded loop of them is a way to fill a table and annoy a gateway, and no honest
-#: client needs more than a handful. Same shape as the handoff-code limiter in tests.py:
-#: in-process and approximate, which is the right size of defence for something the
-#: authenticated user is already identified for.
-_ORDERS_PER_HOUR = 10
-_recent_orders: dict[str, list[float]] = defaultdict(list)
+router = APIRouter(prefix="/billing", tags=["billing"])
 
-#: A Razorpay webhook is a few kilobytes. The cap is generous by two orders of magnitude
-#: and exists only so the one unauthenticated route in this application cannot be made to
-#: hold an arbitrary amount of memory by somebody who has never signed in.
-_MAX_WEBHOOK_BYTES = 256 * 1024
+#: Handing over a purchase costs a call to Google or a signature check against Apple's
+#: certificates. Neither is expensive, but an unbounded loop of them spends a quota that
+#: real purchases need, and no honest app needs more than a handful an hour — a restore
+#: on a phone with every pass ever bought is still a handful. In-process and
+#: approximate, the right size of defence for a caller who is already signed in.
+_PURCHASES_PER_HOUR = 30
+_recent_purchases: dict[str, list[float]] = defaultdict(list)
+
+#: A store notification is a few kilobytes. The cap is generous by two orders of
+#: magnitude and exists only so these two routes, which no user signs, cannot be made to
+#: hold an arbitrary amount of memory before their signatures are checked.
+_MAX_NOTIFICATION_BYTES = 256 * 1024
 
 
-def _rate_limit_orders(uid: str) -> None:
+def _rate_limit_purchases(uid: str) -> None:
     now = time.time()
-    hits = [t for t in _recent_orders[uid] if now - t < 3600]
-    if len(hits) >= _ORDERS_PER_HOUR:
+    hits = [t for t in _recent_purchases[uid] if now - t < 3600]
+    if len(hits) >= _PURCHASES_PER_HOUR:
         raise HTTPException(
             status_code=429,
             detail="That is a lot of attempts in an hour. Try again shortly.",
         )
     hits.append(now)
-    _recent_orders[uid] = hits
+    _recent_purchases[uid] = hits
 
 
-router = APIRouter(prefix="/billing", tags=["billing"])
+async def _account_token(connection: asyncpg.Connection, uid: str) -> str | None:
+    """This student's private purchase id, made the first time it is asked for.
 
-
-async def _owned(connection: asyncpg.Connection, order_id: str, uid: str) -> asyncpg.Record:
-    """The caller's payment, or 404.
-
-    404 rather than 403 for an order belonging to somebody else. Distinguishing "not
-    yours" from "does not exist" tells an enumerator which order ids are real.
+    None only for a student with no profile row yet, who cannot buy until the app has
+    synced one — the same rule the old checkout enforced, for the same reason: a purchase
+    must have somewhere to land.
     """
-    row = await connection.fetchrow(
-        "SELECT order_id, firebase_uid, tenant_id, status FROM payments WHERE order_id = $1",
-        order_id,
+    token = await connection.fetchval(
+        "SELECT store_account_token FROM users WHERE firebase_uid = $1", uid
     )
-    if row is None or row["firebase_uid"] != uid:
-        raise HTTPException(status_code=404, detail="No such payment")
-    return row
-
-
-#: A failure reason is the only free text a client can put in this table, and it is read
-#: back by a person in an admin panel. Kept to printable characters and one line, so what
-#: lands in the database is a sentence rather than whatever fitted in the field.
-_REASON_LIMIT = 200
-
-
-def _as_dict(value: object) -> dict:
-    """A dictionary, whatever arrived. Missing, null and wrong-typed all read as empty."""
-    return value if isinstance(value, dict) else {}
-
-
-def _receipt(uid: str) -> str:
-    """A short, unique-per-order merchant reference. Razorpay allows forty characters."""
-    return f"jn_{uid[:20]}_{secrets.token_hex(6)}"[:40]
-
-
-def _clean_reason(reason: str) -> str:
-    """The client's account of what went wrong, made safe to store and to read."""
-    flattened = " ".join((reason or "").split())
-    printable = "".join(c for c in flattened if c.isprintable())
-    return printable[:_REASON_LIMIT]
+    if token is None:
+        token = await connection.fetchval(
+            """
+            UPDATE users SET store_account_token = gen_random_uuid()
+             WHERE firebase_uid = $1 AND store_account_token IS NULL
+            RETURNING store_account_token
+            """,
+            uid,
+        )
+        if token is None:
+            # Either there is no such student, or a concurrent request set it first.
+            token = await connection.fetchval(
+                "SELECT store_account_token FROM users WHERE firebase_uid = $1", uid
+            )
+    return str(token) if token else None
 
 
 async def _entitlement_view(
-    connection: asyncpg.Connection, uid: str, tenant: str
+    connection: asyncpg.Connection, uid: str, tenant: str, *, with_token: bool = False
 ) -> EntitlementView:
     held = await entitlements.entitlement_of(connection, uid, tenant)
     return EntitlementView(
         tier=held.tier, active=held.active,
         expires_at=held.expires_at, days_remaining=held.days_remaining,
+        account_token=await _account_token(connection, uid) if with_token else None,
     )
 
+
+async def _body(request: Request) -> bytes:
+    """The raw body of an unauthenticated route, refused before it is read if it is too big."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_NOTIFICATION_BYTES:
+        raise HTTPException(status_code=413, detail="too large")
+    raw = await request.body()
+    if len(raw) > _MAX_NOTIFICATION_BYTES:
+        raise HTTPException(status_code=413, detail="too large")
+    return raw
+
+
+# --- reads -------------------------------------------------------------------------------
 
 @router.get("/products", response_model=list[Product])
 async def list_products(
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> list[Product]:
-    """What this tenant sells, cheapest first by the order an admin chose.
+    """What this tenant sells, in the order an admin chose.
 
-    Open to anonymous callers, like the catalogue. A price is not a secret, and a paywall
-    that cannot be read until you have signed up is a paywall nobody signs up for.
+    Open to anonymous callers. A price is not a secret, and a paywall that cannot be read
+    until you have signed up is a paywall nobody signs up for.
 
-    Retired products are excluded here and nowhere else: a payment made against one still
-    resolves, because `payments` copies the price and duration at creation rather than
-    joining back to a row that may since have been switched off.
+    Retired passes are excluded here and nowhere else: a purchase of one still resolves,
+    because a store purchase is matched to its pass by store product id, active or not.
     """
     rows = await connection.fetch(
         """
         SELECT product_id, title, tier, amount_paise, currency, duration_days,
-               badge, sort_order
+               badge, sort_order, google_product_id, apple_product_id
           FROM products
          WHERE tenant_id = $1 AND active
          ORDER BY sort_order, amount_paise
@@ -163,419 +162,201 @@ async def my_entitlement(
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> EntitlementView:
-    """Whether this student has Pro, and until when.
+    """Whether this student has Pro, until when, and the id their purchases carry.
 
-    The app polls this after a purchase, so it is deliberately cheap: one indexed read of
-    the cache that every grant writes.
+    The app polls this while a purchase is being confirmed, so it is deliberately cheap:
+    one indexed read of the cache every grant writes, and one of the token.
 
     `active` is decided here rather than by comparing `expires_at` on the device. A phone
     with a wrong clock — or a deliberately wrong one — must not be able to unlock
     anything, and the gates on the write endpoints ask this same code regardless.
     """
-    return await _entitlement_view(connection, user["uid"], tenant)
+    return await _entitlement_view(connection, user["uid"], tenant, with_token=True)
 
 
-@router.post("/quote", response_model=QuoteResponse)
-async def quote(
-    body: QuoteRequest,
+# --- the app handing over a purchase -----------------------------------------------------
+
+@router.post("/purchases", response_model=StorePurchaseResponse)
+async def submit_purchase(
+    body: StorePurchaseRequest,
     user: dict = Depends(require_user),
     tenant: str = Depends(current_tenant),
     connection: asyncpg.Connection = Depends(get_connection),
-) -> QuoteResponse:
-    """What this product costs this student, signed so it cannot be edited.
+) -> StorePurchaseResponse:
+    """A purchase the store just completed, or one the app found unfinished.
 
-    The price is read from the database here and read from the database *again* at order
-    time. This token is not the authority on what to charge — it is a record of what was
-    promised, so the order endpoint can notice if the two have diverged and refuse rather
-    than silently charging the newer figure to somebody who agreed to the older one.
+    Four steps in a fixed order, and the order is the point:
+
+    **The store is asked.** Google's API for an Android purchase; Apple's certificate
+    chain for an iPhone one. Nothing the app said about the purchase is used.
+
+    **The owner is decided** — the account the purchase names, not necessarily the one
+    signed in. A pass bought by one student and handed over from a phone where a sibling
+    has since signed in still lands on the account that paid.
+
+    **It is recorded and, if paid, granted** — once, however many times it is handed
+    over.
+
+    **Google is told** — consumed, after the grant and never before. A failure here is
+    the reconciler's to retry, not the student's problem.
+
+    Errors are answered so the app knows whether to keep the purchase and try again: a
+    5xx means "try again later, keep it", and only a definite answer ever says `finish`.
     """
-    row = await connection.fetchrow(
-        """
-        SELECT product_id, title, amount_paise, currency, duration_days
-          FROM products
-         WHERE product_id = $1 AND tenant_id = $2 AND active
-        """,
-        body.product_id, tenant,
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="That is not something we sell")
-
-    token = quotes.sign(
-        uid=user["uid"],
-        product_id=row["product_id"],
-        amount_paise=row["amount_paise"],
-        currency=row["currency"],
-        duration_days=row["duration_days"],
-    )
-    return QuoteResponse(
-        quote=token,
-        product_id=row["product_id"],
-        title=row["title"],
-        amount_paise=row["amount_paise"],
-        currency=row["currency"],
-        duration_days=row["duration_days"],
-        expires_in_seconds=quotes.DEFAULT_TTL_SECONDS,
-    )
-
-
-@router.post("/orders", response_model=OrderResponse)
-async def create_order(
-    body: OrderRequest,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
-    connection: asyncpg.Connection = Depends(get_connection),
-) -> OrderResponse:
-    """Turn a quote into an order the checkout SDK can open.
-
-    Three things happen in a fixed order, and the order is the point.
-
-    **The price is recomputed.** The quote says what was promised; the database says what
-    the product costs now. If they disagree the purchase is refused, because charging
-    either figure would be wrong — the new one was never agreed to, and the old one is no
-    longer the price.
-
-    **Razorpay is called before anything is written locally.** If this process dies
-    between the two, what is left is an unpaid order at Razorpay, which Razorpay expires
-    on its own. Writing the row first would leave a payment pending against an order that
-    exists nowhere, and the reconciler would have to invent a way to tell that apart from
-    a genuine one.
-
-    **The amount and duration are copied onto the row.** They are never read back from
-    `products` again. A price change tomorrow must not rewrite what somebody paid today,
-    and a retired product must still produce a legible receipt.
-    """
-    # Before anything else, and before the gateway above all. `payments.firebase_uid`
-    # references `users`, so a student whose profile has never been synced would create a
-    # real order at Razorpay and *then* die on the foreign key — leaving an order nobody
-    # has a local record of, which is the one shape the reconciler cannot see. Checked
-    # here rather than caught below, because by the time the insert fails the order exists.
-    known = await connection.fetchval(
-        "SELECT 1 FROM users WHERE firebase_uid = $1", user["uid"]
-    )
-    if not known:
-        logger.warning("order refused: no profile for %s", user["uid"])
-        raise HTTPException(
-            status_code=409,
-            detail="Please sign in again before buying.",
-        )
-
-    _rate_limit_orders(user["uid"])
+    _rate_limit_purchases(user["uid"])
 
     try:
-        gw = gateway()
+        if body.store == GOOGLE:
+            if not body.purchase_token:
+                raise HTTPException(status_code=400, detail="A purchase token is needed")
+            client = google_play()
+            purchase = await client.get_purchase(body.purchase_token)
+        else:
+            if not body.signed_transaction:
+                raise HTTPException(status_code=400, detail="A signed transaction is needed")
+            store = app_store()
+            purchase = await store.verify_transaction(body.signed_transaction)
     except BillingUnavailable as exc:
-        logger.error("order refused: %s", exc)
+        logger.error("purchase refused: %s", exc)
         raise HTTPException(
-            status_code=503, detail="Payments are not available right now"
+            status_code=503, detail="Purchases are not available right now"
+        ) from exc
+    except ProofRejected as exc:
+        logger.warning("purchase proof rejected for %s: %s", user["uid"], exc)
+        raise HTTPException(
+            status_code=400, detail="We could not confirm that purchase with the store."
+        ) from exc
+    except StoreUnreachable as exc:
+        logger.warning("store unreachable confirming a purchase: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="We could not reach the store just now. Your purchase is safe — "
+                   "we will confirm it shortly.",
         ) from exc
 
+    if body.product_id != purchase.store_product_id:
+        # Not a reason to refuse: the store's answer is the one used. Worth a line in the
+        # log, because an app that names the wrong product has a bug somewhere.
+        logger.warning("app named %r for a purchase of %r", body.product_id,
+                       purchase.store_product_id)
+
     try:
-        promised = quotes.verify(body.quote, uid=user["uid"])
-    except quotes.QuoteInvalid as exc:
-        # One message for every way a quote can be wrong. Which one it was is not the
-        # caller's to learn.
+        owner = await purchases.owner_of(connection, purchase, handed_over_by=user["uid"])
+        if owner is None:  # pragma: no cover — handed_over_by is always set here
+            raise purchases.UnknownAccount("nobody to credit")
+        outcome = await purchases.record(connection, purchase, owner)
+    except purchases.UnknownAccount as exc:
+        logger.warning("purchase from %s could not be attributed: %s", user["uid"], exc)
         raise HTTPException(
-            status_code=400, detail="That price is no longer valid. Please try again."
+            status_code=409, detail="Please sign in again before buying."
         ) from exc
+    except purchases.NotForSale as exc:
+        logger.error("a store purchase of something we do not sell: %s", exc)
+        raise HTTPException(status_code=400, detail="That is not something we sell") from exc
 
-    row = await connection.fetchrow(
-        """
-        SELECT product_id, title, amount_paise, currency, duration_days
-          FROM products
-         WHERE product_id = $1 AND tenant_id = $2 AND active
-        """,
-        promised.product_id, tenant,
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="That is not something we sell")
+    if purchase.store == GOOGLE:
+        await purchases.consume_if_due(connection, client, purchase, outcome)
 
-    if (row["amount_paise"], row["currency"], row["duration_days"]) != (
-        promised.amount_paise, promised.currency, promised.duration_days
-    ):
-        logger.warning(
-            "quote/product mismatch for %s: promised %s, now %s",
-            promised.product_id, promised.amount_paise, row["amount_paise"],
-        )
-        raise HTTPException(
-            status_code=409, detail="The price changed. Please take another look."
-        )
+    status = outcome.status
+    if outcome.owner.uid != user["uid"]:
+        status = purchases.OTHER_ACCOUNT
+        logger.info("purchase handed over by %s belongs to %s", user["uid"], outcome.owner.uid)
 
-    try:
-        order = await gw.create_order(
-            amount_paise=row["amount_paise"],
-            currency=row["currency"],
-            # Razorpay caps a receipt at 40 characters, and treats it as the merchant's
-            # own reference — one per order. Keyed on the student alone it repeated for
-            # every purchase they made, which is useless for reconciling a statement and
-            # breaks outright on an account with "unique receipt" turned on.
-            receipt=_receipt(user["uid"]),
-            notes={"firebase_uid": user["uid"], "product_id": row["product_id"],
-                   "tenant_id": tenant},
-        )
-    except Exception as exc:  # noqa: BLE001 — every gateway failure is one answer here
-        logger.exception("could not create a Razorpay order")
-        raise HTTPException(
-            status_code=502, detail="We could not reach the payment provider"
-        ) from exc
-
-    await connection.execute(
-        """
-        INSERT INTO payments (order_id, firebase_uid, tenant_id, product_id,
-                              amount_paise, currency, duration_days, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-        """,
-        order.order_id, user["uid"], tenant, row["product_id"],
-        row["amount_paise"], row["currency"], row["duration_days"],
-    )
-
-    return OrderResponse(
-        order_id=order.order_id,
-        key_id=settings.razorpay_key_id or "",
-        amount_paise=row["amount_paise"],
-        currency=row["currency"],
-        product_id=row["product_id"],
-        title=row["title"],
-    )
-
-
-@router.post("/verify", response_model=SettlementResponse)
-async def verify_payment(
-    body: VerifyRequest,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
-    connection: asyncpg.Connection = Depends(get_connection),
-) -> SettlementResponse:
-    """The app saying checkout succeeded. Checked twice before it is believed.
-
-    **The signature** proves the callback really came from Razorpay and was not typed by
-    a patched client. It does not prove money moved: an authorised-but-uncaptured payment
-    signs identically.
-
-    **The fetch** is what proves it. A server-to-server read of the payment is the only
-    thing that can say `captured`, and nothing is granted without it.
-
-    A payment that turns out not to be captured is *not* failed here. It may still be in
-    flight, and failing it would release a student who is about to pay. The reconciler
-    decides that later, when a few minutes have made the answer unambiguous.
-    """
-    await _owned(connection, body.order_id, user["uid"])
-
-    try:
-        gw = gateway()
-    except BillingUnavailable as exc:
-        raise HTTPException(status_code=503, detail="Payments are not available") from exc
-
-    if not gw.verify_payment_signature(
-        order_id=body.order_id, payment_id=body.payment_id, signature=body.signature
-    ):
-        logger.warning("bad payment signature on %s", body.order_id)
-        raise HTTPException(status_code=400, detail="We could not verify that payment")
-
-    try:
-        payment = await gw.fetch_payment(body.payment_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("could not fetch payment %s", body.payment_id)
-        raise HTTPException(
-            status_code=502, detail="We could not confirm that payment just now"
-        ) from exc
-
-    if payment.order_id and payment.order_id != body.order_id:
-        # The signature covers this pairing, so reaching here means something stranger
-        # than a tampered request. Refuse rather than reason about it.
-        logger.error("payment %s is for order %s, not %s",
-                     body.payment_id, payment.order_id, body.order_id)
-        raise HTTPException(status_code=400, detail="We could not verify that payment")
-
-    if not payment.captured:
-        # Deliberately not a settlement. See the docstring.
-        current = await _owned(connection, body.order_id, user["uid"])
-        return SettlementResponse(order_id=body.order_id, status=current["status"])
-
-    outcome = await settle.settle(
-        connection, body.order_id, to=settle.PAID,
-        payment_id=payment.payment_id, payload=payment.raw,
-        paid_paise=payment.amount_paise,
-    )
-    return SettlementResponse(
-        order_id=body.order_id,
-        status=outcome.status,
+    return StorePurchaseResponse(
+        status=status,
+        # Only a purchase still pending at the store stays unfinished on the phone.
+        finish=purchase.state != PENDING,
         entitlement=await _entitlement_view(connection, user["uid"], tenant),
     )
 
 
-@router.post("/failed", response_model=SettlementResponse)
-async def report_failure(
-    body: FailureRequest,
-    user: dict = Depends(require_user),
-    tenant: str = Depends(current_tenant),
-    connection: asyncpg.Connection = Depends(get_connection),
-) -> SettlementResponse:
-    """The app reporting checkout did not complete. Confirmed before it is acted on.
+# --- the stores' own notifications -------------------------------------------------------
 
-    This exists to release a pending row in a second rather than in ten minutes, so a
-    student who cancels can try again immediately instead of being told a payment is
-    still going through.
-
-    A client claim never fails a payment on its own. The gateway is asked first, and two
-    answers override the report:
-
-    **Something was captured.** The report is ignored and the payment is settled as paid —
-    otherwise a patched client could mark its own successful payment as failed and keep
-    the access.
-
-    **Something is still in flight.** A UPI intent handed off to another app looks exactly
-    like an abandoned checkout from here, right up until it does not. Leaving the row
-    pending costs the student nothing; failing it while their bank is still deciding would
-    send the capture that follows into manual review.
-    """
-    await _owned(connection, body.order_id, user["uid"])
-
-    try:
-        gw = gateway()
-        attempts = await gw.fetch_order_payments(body.order_id)
-    except BillingUnavailable as exc:
-        raise HTTPException(status_code=503, detail="Payments are not available") from exc
-    except Exception as exc:  # noqa: BLE001
-        # Cannot confirm, so nothing is written. The reconciler will settle it.
-        logger.warning("could not check order %s before failing it", body.order_id)
-        raise HTTPException(
-            status_code=502, detail="We could not confirm that just now"
-        ) from exc
-
-    captured = next((p for p in attempts if p.captured), None)
-    if captured is None and any(p.in_flight for p in attempts):
-        logger.info("failure report held: %s still has an attempt in flight", body.order_id)
-        current = await _owned(connection, body.order_id, user["uid"])
-        return SettlementResponse(order_id=body.order_id, status=current["status"])
-
-    if captured is not None:
-        logger.info("failure report ignored: %s was captured", body.order_id)
-        outcome = await settle.settle(
-            connection, body.order_id, to=settle.PAID,
-            payment_id=captured.payment_id, payload=captured.raw,
-            paid_paise=captured.amount_paise,
-        )
-        return SettlementResponse(
-            order_id=body.order_id, status=outcome.status,
-            entitlement=await _entitlement_view(connection, user["uid"], tenant),
-        )
-
-    outcome = await settle.settle(
-        connection, body.order_id, to=settle.FAILED,
-        failure_reason=_clean_reason(body.reason) or "the payment was not completed",
-    )
-    return SettlementResponse(order_id=body.order_id, status=outcome.status)
-
-
-@router.post("/webhook", include_in_schema=False)
-async def webhook(
+@router.post("/google/notifications", include_in_schema=False)
+async def google_notification(
     request: Request,
-    x_razorpay_signature: str = Header(default=""),
+    authorization: str = Header(default=""),
     connection: asyncpg.Connection = Depends(get_connection),
 ) -> dict[str, str]:
-    """Razorpay's own account of what happened.
+    """Google Play's real-time developer notifications, pushed by Pub/Sub.
 
-    No user authentication, because Razorpay has no user token — the HMAC over the raw
-    body is the authentication, and it is the only thing standing between this route and
-    anybody who can reach the internet.
+    No user and no shared secret: the OpenID token Pub/Sub signs for our subscription is
+    the whole of the authentication, and it is checked before the body is looked at.
 
-    The signature is checked against the **unparsed bytes**. Re-serialising the JSON
-    changes whitespace and key order, and the signature covers what was sent rather than
-    what it meant.
-
-    Always answers 200 once the signature is good, even for an event that changes
-    nothing. A non-200 tells Razorpay to redeliver, and asking to be told again about
-    something already handled is how a retry storm starts.
-
-    Only a capture settles anything here. `payment.failed` describes **one attempt**, not
-    the order: a student who mistypes a CVV and then pays produces exactly that pair of
-    events against the same order id, and treating the first as final would put an
-    ordinary successful purchase into manual review. Ending an unpaid payment is left to
-    the two paths that can tell an abandoned checkout from a retry — the app, which knows
-    the sheet was closed, and the reconciler, which waits half an hour and asks.
+    Answers 200 once a message is handled — including one that changes nothing — because
+    any other answer tells Pub/Sub to deliver it again. The one exception is Google being
+    unreachable while a purchase is read back: that is answered 503 on purpose, so the
+    message comes back when the answer can be had.
     """
-    # Read before authenticating, because the signature is over the body — which makes
-    # the size the one thing worth checking first. This endpoint takes no token, so
-    # anybody who can reach the internet can post to it, and `request.body()` will happily
-    # hold a gigabyte in memory before the HMAC ever gets a look at it.
-    declared = request.headers.get("content-length")
-    if declared and declared.isdigit() and int(declared) > _MAX_WEBHOOK_BYTES:
-        logger.warning("webhook rejected: declared %s bytes", declared)
-        raise HTTPException(status_code=413, detail="too large")
-
-    raw = await request.body()
-    if len(raw) > _MAX_WEBHOOK_BYTES:
-        logger.warning("webhook rejected: %d bytes", len(raw))
-        raise HTTPException(status_code=413, detail="too large")
-
+    raw = await _body(request)
     try:
-        gw = gateway()
+        client = google_play()
     except BillingUnavailable:
-        # Nothing can be verified, so nothing may be believed.
-        logger.error("webhook arrived while billing is unconfigured")
+        logger.error("Google notification arrived while Google Play is not configured")
         raise HTTPException(status_code=503, detail="unavailable") from None
 
-    if not gw.verify_webhook_signature(body=raw, signature=x_razorpay_signature):
-        logger.warning("webhook with a bad signature, %d bytes", len(raw))
-        raise HTTPException(status_code=400, detail="bad signature")
+    try:
+        await client.verify_push(authorization)
+    except ProofRejected:
+        logger.warning("Google notification with a bad token, %d bytes", len(raw))
+        raise HTTPException(status_code=401, detail="unauthenticated") from None
 
     try:
-        event = json.loads(raw)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="bad body") from None
-    if not isinstance(event, dict):
-        # Signed, so it came from Razorpay — but a 500 here is answered with a redelivery,
-        # and a redelivery of something unparseable is a loop.
+        envelope = json.loads(raw)
+        data = envelope["message"]["data"]
+        notification = json.loads(base64.b64decode(data))
+    except (ValueError, KeyError, TypeError, binascii.Error):
+        # Authenticated, so it came from Pub/Sub — but redelivering something unreadable
+        # would only loop. Acknowledged and logged.
+        logger.error("Google notification we could not read")
+        return {"status": "ignored: unreadable"}
+    if not isinstance(notification, dict):
+        return {"status": "ignored: unreadable"}
+
+    try:
+        result = await handle_google(connection, client, notification)
+    except StoreUnreachable:
+        raise HTTPException(status_code=503, detail="try again") from None
+    except ProofRejected:
+        logger.warning("Google notification names a purchase Google will not confirm")
+        result = "ignored: not confirmed"
+    logger.info("Google notification: %s", result)
+    return {"status": result}
+
+
+@router.post("/apple/notifications", include_in_schema=False)
+async def apple_notification(
+    request: Request,
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> dict[str, str]:
+    """App Store Server Notifications (version 2).
+
+    Apple signs the payload, and the transaction inside it, with the same certificate
+    chain as any transaction; both are checked before anything is read. Answers 200 once
+    handled, so Apple stops retrying; a forged or unreadable body is refused.
+    """
+    raw = await _body(request)
+    try:
+        store = app_store()
+    except BillingUnavailable:
+        logger.error("Apple notification arrived while the App Store is not configured")
+        raise HTTPException(status_code=503, detail="unavailable") from None
+
+    try:
+        signed = json.loads(raw).get("signedPayload")
+    except (ValueError, AttributeError):
+        signed = None
+    if not isinstance(signed, str) or not signed:
         raise HTTPException(status_code=400, detail="bad body")
 
-    name = event.get("event", "")
-
-    # `order.paid` carries both entities; the payment one is preferred because it is the
-    # only place the payment id lives, and that id is what a refund is issued against.
-    #
-    # Every step is defended rather than chained. A missing key gives `{}` and reads on;
-    # a key present but null would give `None` and an AttributeError, and this route
-    # answers an AttributeError with a 500, which Razorpay answers with the same webhook
-    # again, for ever.
-    payload = _as_dict(event.get("payload"))
-    payment = _as_dict(_as_dict(payload.get("payment")).get("entity"))
-    order = _as_dict(_as_dict(payload.get("order")).get("entity"))
-    entity = payment or order
-    order_id = entity.get("order_id") or entity.get("id", "")
-    if not isinstance(order_id, str):
-        order_id = ""
-    if not order_id:
-        logger.info("webhook %s carried no order id", name)
-        return {"status": "ignored"}
-
-    if name == "payment.failed":
-        noted = await settle.record_failed_attempt(
-            connection, order_id,
-            payment_id=payment.get("id"),
-            reason=entity.get("error_description") or "",
-            payload=entity,
-        )
-        logger.info("attempt failed on %s (%s); payment left open",
-                    order_id, entity.get("error_description") or "no reason given")
-        return {"status": "noted" if noted else "ignored"}
-
-    if name not in ("payment.captured", "order.paid"):
-        return {"status": "ignored"}
-
     try:
-        amount = payment.get("amount")
-        outcome = await settle.settle(
-            connection, order_id, to=settle.PAID,
-            payment_id=payment.get("id"),
-            payload=entity,
-            paid_paise=int(amount) if amount is not None else None,
-        )
-    except settle.UnknownOrder:
-        # An order this deployment did not create — a webhook aimed at the wrong
-        # environment, most likely. Acknowledged so it is not redelivered for ever.
-        logger.warning("webhook for an unknown order: %s", order_id)
-        return {"status": "unknown"}
+        note = await store.verify_notification(signed)
+    except ProofRejected:
+        logger.warning("Apple notification that did not verify, %d bytes", len(raw))
+        raise HTTPException(status_code=400, detail="bad signature") from None
+    except StoreUnreachable:
+        raise HTTPException(status_code=503, detail="try again") from None
 
-    logger.info("webhook %s settled %s as %s (changed=%s)",
-                name, order_id, outcome.status, outcome.changed)
-    return {"status": outcome.status}
+    result = await handle_apple(connection, note)
+    logger.info("Apple notification %s (%s): %s", note.kind, note.uuid, result)
+    return {"status": result}

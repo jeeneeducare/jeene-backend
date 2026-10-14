@@ -315,6 +315,11 @@ class ProductWrite(BaseModel):
     badge: str = ""
     sort_order: int = 0
     active: bool = True
+    #: Which store product this pass is on each platform. Left out, the pass is not
+    #: offered on that platform. Must match the product id typed into Play Console or App
+    #: Store Connect exactly, and those can never be changed once created.
+    google_product_id: str | None = None
+    apple_product_id: str | None = None
 
 
 @router.get("/products", response_model=list[AdminProduct])
@@ -326,7 +331,8 @@ async def list_all_products(
     rows = await connection.fetch(
         """
         SELECT product_id, title, tier, amount_paise, currency, duration_days,
-               badge, sort_order, active, created_at, updated_at
+               badge, sort_order, google_product_id, apple_product_id,
+               active, created_at, updated_at
           FROM products WHERE tenant_id = $1
          ORDER BY sort_order, amount_paise
         """,
@@ -348,9 +354,10 @@ async def upsert_product(
     A price must be positive and a duration must be at least a day. The database says so
     too, in a CHECK constraint; this exists to answer with a sentence rather than a 500.
 
-    **Amending a price never touches money already taken.** `payments` copies the amount
-    and the duration at creation, so changing a product repriced tomorrow's purchases and
-    nothing else. That is the whole reason those columns are duplicated there.
+    **Amending a pass never touches what was already bought.** A store purchase copies
+    the duration when it is recorded, so lengthening a pass changes tomorrow's purchases
+    and nothing else. The price a student pays is the store's, set in Play Console and App
+    Store Connect; `amount_paise` here is only the list price the app falls back to.
     """
     if body.amount_paise <= 0:
         raise HTTPException(status_code=400, detail="A price has to be more than nothing")
@@ -359,14 +366,32 @@ async def upsert_product(
     if body.currency != "INR":
         raise HTTPException(
             status_code=400,
-            detail="Only INR is set up today — the gateway account is Indian",
+            detail="Only INR is set up today — the passes are sold in India only",
         )
 
-    row = await connection.fetchrow(
+    try:
+        row = await _upsert_product(connection, body, admin["tenant_id"])
+    except asyncpg.UniqueViolationError:
+        # The only unique columns a write can collide on besides the id are the store
+        # product ids: one store product has to be exactly one pass.
+        raise HTTPException(
+            status_code=409, detail="That store product id is already used by another pass"
+        ) from None
+    if row is None:
+        # The ON CONFLICT clause refused because the id belongs to another tenant.
+        raise HTTPException(status_code=409, detail="That product id is taken")
+    return AdminProduct(**dict(row))
+
+
+async def _upsert_product(
+    connection: asyncpg.Connection, body: "ProductWrite", tenant: str
+) -> asyncpg.Record | None:
+    return await connection.fetchrow(
         """
         INSERT INTO products (product_id, tenant_id, title, tier, amount_paise, currency,
-                              duration_days, badge, sort_order, active)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                              duration_days, badge, sort_order, active,
+                              google_product_id, apple_product_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (product_id) DO UPDATE SET
             title = EXCLUDED.title,
             tier = EXCLUDED.tier,
@@ -376,18 +401,18 @@ async def upsert_product(
             badge = EXCLUDED.badge,
             sort_order = EXCLUDED.sort_order,
             active = EXCLUDED.active,
+            google_product_id = EXCLUDED.google_product_id,
+            apple_product_id = EXCLUDED.apple_product_id,
             updated_at = now()
           WHERE products.tenant_id = EXCLUDED.tenant_id
         RETURNING product_id, title, tier, amount_paise, currency, duration_days,
-                  badge, sort_order, active, created_at, updated_at
+                  badge, sort_order, google_product_id, apple_product_id,
+                  active, created_at, updated_at
         """,
-        body.product_id, admin["tenant_id"], body.title, body.tier, body.amount_paise,
+        body.product_id, tenant, body.title, body.tier, body.amount_paise,
         body.currency, body.duration_days, body.badge, body.sort_order, body.active,
+        body.google_product_id or None, body.apple_product_id or None,
     )
-    if row is None:
-        # The ON CONFLICT clause refused because the id belongs to another tenant.
-        raise HTTPException(status_code=409, detail="That product id is taken")
-    return AdminProduct(**dict(row))
 
 
 @router.delete("/products/{product_id}", response_model=AdminProduct)
@@ -407,7 +432,8 @@ async def retire_product(
         UPDATE products SET active = FALSE, updated_at = now()
          WHERE product_id = $1 AND tenant_id = $2
         RETURNING product_id, title, tier, amount_paise, currency, duration_days,
-                  badge, sort_order, active, created_at, updated_at
+                  badge, sort_order, google_product_id, apple_product_id,
+                  active, created_at, updated_at
         """,
         product_id, admin["tenant_id"],
     )

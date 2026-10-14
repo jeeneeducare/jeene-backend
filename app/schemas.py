@@ -763,11 +763,15 @@ class CheckpointResult(BaseModel):
 # --- Billing ------------------------------------------------------------------------
 
 class Product(BaseModel):
-    """One thing a student can buy.
+    """One pass a student can buy.
 
-    `amount_paise` is what the app formats and what the server charges; there is no
-    float anywhere in this path. The app is told the price so it can draw a card, and is
-    never trusted to send one back.
+    The stores set the price a student actually pays, and the app shows the store's own
+    label for it. `amount_paise` is the list price the passes were set up at: the app
+    falls back to it only to draw a card before the store has answered, and it is never
+    charged by anything.
+
+    `google_product_id` and `apple_product_id` say which store product this pass is on
+    each platform. A pass missing one is simply not offered on that platform.
     """
     product_id: str
     title: str
@@ -777,19 +781,26 @@ class Product(BaseModel):
     duration_days: int
     badge: str = ""
     sort_order: int = 0
+    google_product_id: str | None = None
+    apple_product_id: str | None = None
 
 
 class EntitlementView(BaseModel):
-    """What the app needs to decide whether to draw a lock.
+    """What the app needs to decide whether to draw a lock, and to start a purchase.
 
     `expires_at` is null for a student who has never subscribed. `active` is computed
     server-side rather than left to the client to derive from the date, so a device with
     a wrong clock cannot unlock anything.
+
+    `account_token` is the private id the app attaches to a store purchase — Apple's
+    `appAccountToken`, Google's `obfuscatedAccountId` — so the purchase is credited to
+    this account however it reaches us. It identifies nobody outside this backend.
     """
     tier: str
     active: bool
     expires_at: datetime | None = None
     days_remaining: int = 0
+    account_token: str | None = None
 
 
 class AdminProduct(Product):
@@ -799,73 +810,33 @@ class AdminProduct(Product):
     updated_at: datetime
 
 
-class QuoteRequest(BaseModel):
-    """Which product a student wants. Notably not how much it costs."""
-    product_id: str = Field(max_length=64)
+class StorePurchaseRequest(BaseModel):
+    """A purchase the store has just completed, handed over by the app.
 
+    Nothing here is believed. The token or signed transaction is the store's own proof,
+    and it is checked with the store before anything is written; `product_id` is the
+    app's account of what it bought, kept for the log and never used to decide.
 
-class QuoteResponse(BaseModel):
-    """A signed promise, plus what to draw on the confirm button.
-
-    The amount is repeated in the clear only so the app can render it. It is read from
-    the signed token on the way back in, never from this field.
+    Bounded because these are client-supplied strings on a route that calls Google and
+    Apple. A Google token is a couple of hundred characters; an Apple signed transaction,
+    which carries its own certificate chain, is a few kilobytes.
     """
-    quote: str
-    product_id: str
-    title: str
-    amount_paise: int
-    currency: str
-    duration_days: int
-    expires_in_seconds: int
+    store: Literal["google", "apple"]
+    product_id: str = Field(max_length=100)
+    purchase_token: str | None = Field(default=None, max_length=4096)
+    signed_transaction: str | None = Field(default=None, max_length=32768)
 
 
-class OrderRequest(BaseModel):
-    """The signed quote, handed straight back. Bounded: it is a client-supplied string on
-    the one route that creates a real order at a payment gateway."""
-    quote: str = Field(max_length=2048)
+class StorePurchaseResponse(BaseModel):
+    """Where the purchase ended up, and what the student now has.
 
-
-class OrderResponse(BaseModel):
-    """Everything the checkout SDK needs, and nothing it does not.
-
-    `key_id` is the publishable half of the key pair. It is here because the SDK cannot
-    open without it; the secret never leaves the server.
+    `finish` tells the app whether the purchase is settled as far as the store is
+    concerned — whether Apple's transaction may be finished. It is false only while a
+    purchase is still pending at the store; any error answer means the same as false.
     """
-    order_id: str
-    key_id: str
-    amount_paise: int
-    currency: str
-    product_id: str
-    title: str
-
-
-class VerifyRequest(BaseModel):
-    """What the checkout SDK hands back on success.
-
-    Every field is the client's word for something. The signature makes the first two
-    checkable; nothing here is trusted until the gateway has been asked directly.
-
-    Bounded because unbounded strings on a payment route are free memory for anybody with
-    an account. Razorpay ids are around twenty characters and the signature is a
-    sixty-four character digest; these are generous and still finite.
-    """
-    order_id: str = Field(max_length=64)
-    payment_id: str = Field(max_length=64)
-    signature: str = Field(max_length=256)
-
-
-class FailureRequest(BaseModel):
-    """The app reporting that checkout did not complete.
-
-    A claim, not a fact — confirmed against the gateway before anything is written, so a
-    patched client cannot mark a captured payment as failed.
-
-    `reason` is the only free text a client writes into the payments table. It is capped
-    here as well as flattened at the router, because truncating a megabyte after receiving
-    it is not the same as refusing to receive one.
-    """
-    order_id: str = Field(max_length=64)
-    reason: str = Field(default="", max_length=500)
+    status: str
+    finish: bool
+    entitlement: EntitlementView | None = None
 
 
 class GateBlocked(BaseModel):
@@ -893,24 +864,18 @@ class ReconcileReport(BaseModel):
     #: settled — but a cron log should say whether that is because there was nothing to do
     #: or because this deployment does not sell anything.
     status: str = "swept"
-    examined: int
-    paid: int
-    failed: int
-    review: int
-    #: Still in flight, or the gateway could not be reached about them. Neither is a
-    #: problem: the next sweep asks again.
-    left_pending: int
-
-
-class SettlementResponse(BaseModel):
-    """Where the payment ended up, and what the student now has.
-
-    `entitlement` is included so a successful verify needs no second round trip before
-    the app can unlock what was blocked.
-    """
-    order_id: str
-    status: str
-    entitlement: EntitlementView | None = None
+    #: Google purchases granted earlier and consumed now, before Google's three-day
+    #: refund of anything left unacknowledged.
+    consumed: int = 0
+    #: Purchases granted by this sweep: a pending one that has since been paid, or a
+    #: notification the route never received.
+    granted: int = 0
+    cancelled: int = 0
+    refunded: int = 0
+    #: Still pending at the store. Not a problem: the next sweep asks again.
+    left_pending: int = 0
+    #: A store could not be reached about something. Also asked again next time.
+    errors: int = 0
 
 
 # --- Ask Jeene -----------------------------------------------------------------------------

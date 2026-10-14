@@ -180,6 +180,48 @@ def test_an_admin_can_create_and_amend_a_product(admin_client):
         _sql(("DELETE FROM products WHERE product_id = $1", (product_id,)))
 
 
+def test_a_pass_names_its_store_products_and_the_paywall_passes_them_on(admin_client):
+    """The app needs to know which store product to ask for on its own platform.
+
+    Read back through the admin client: two TestClients in one test would each start the
+    app, and the second would replace the first's connection pool mid-test.
+    """
+    product_id = f"test_prod_{uuid.uuid4().hex[:8]}"
+    sku = f"test.pass.{uuid.uuid4().hex[:8]}"
+    try:
+        created = admin_client.post("/admin/products", json={
+            "product_id": product_id, "title": "Monthly", "amount_paise": 19900,
+            "duration_days": 30, "google_product_id": sku, "apple_product_id": sku,
+        })
+        assert created.status_code == 200, created.text
+        assert created.json()["google_product_id"] == sku
+
+        listed = next(p for p in admin_client.get("/billing/products").json()
+                      if p["product_id"] == product_id)
+        assert (listed["google_product_id"], listed["apple_product_id"]) == (sku, sku)
+    finally:
+        _sql(("DELETE FROM products WHERE product_id = $1", (product_id,)))
+
+
+def test_one_store_product_cannot_be_two_passes(admin_client):
+    """A store purchase is matched to its pass by this id; it has to name exactly one."""
+    first, second = (f"test_prod_{uuid.uuid4().hex[:8]}" for _ in range(2))
+    sku = f"test.pass.{uuid.uuid4().hex[:8]}"
+    try:
+        assert admin_client.post("/admin/products", json={
+            "product_id": first, "title": "A", "amount_paise": 100, "duration_days": 1,
+            "google_product_id": sku,
+        }).status_code == 200
+        clash = admin_client.post("/admin/products", json={
+            "product_id": second, "title": "B", "amount_paise": 100, "duration_days": 1,
+            "google_product_id": sku,
+        })
+        assert clash.status_code == 409
+        assert "store product" in clash.json()["detail"]
+    finally:
+        _sql(("DELETE FROM products WHERE product_id = ANY($1)", ([first, second],)))
+
+
 def test_a_price_of_nothing_is_refused_with_a_sentence(admin_client):
     response = admin_client.post("/admin/products", json={
         "product_id": "test_free", "title": "Free", "amount_paise": 0, "duration_days": 30,
@@ -197,7 +239,7 @@ def test_a_pass_lasting_no_time_is_refused(admin_client):
 
 
 def test_retiring_hides_a_product_without_deleting_it(admin_client, a_product):
-    """Payments reference products forever. A delete would orphan somebody's receipt."""
+    """Purchases reference products forever. A delete would orphan somebody's receipt."""
     response = admin_client.delete(f"/admin/products/{a_product}")
     assert response.status_code == 200
     assert response.json()["active"] is False

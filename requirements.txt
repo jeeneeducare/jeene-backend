@@ -9,3 +9,7 @@ openai==3.6.0
 httpx==0.28.1
 # Reads the text out of chapter notes so Ask Jeene can ground an answer in them.
 pypdf==6.18.0
+# Apple's official library for App Store signed transactions and notifications: checks
+# the certificate chain up to Apple Root CA - G3, the signature, the bundle id and the
+# environment. See app/billing/app_store_client.py.
+app-store-server-library==3.1.2
