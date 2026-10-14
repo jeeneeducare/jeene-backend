@@ -61,15 +61,17 @@ requirements.txt
 8. **Typed responses.** Return Pydantic models so the OpenAPI docs stay an accurate contract for
    the app team.
 9. **Secrets never in code, logs, tickets, or this file.** Environment variables only.
-10. **Money is never taken on the client's word, and never in floating point.** The app names a
-    product; the server prices it from `products`, signs the quote, and prices it again before
-    charging — an amount sent by a client is refused, not used. Every price is an integer number
-    of paise end to end. Access is granted only after a server-to-server confirmation that the
-    payment was **captured**: a valid signature proves the callback is genuine, not that money
-    moved. Only `app/billing/settle.py` writes `payments.status`, because four independent paths
-    confirm the same payment and all four have to agree; anything that would end a payment goes
-    through it. Entitlements are an append-only ledger folded in order — never a mutable expiry
-    column some code path edits.
+10. **A purchase is never taken on the client's word, and a price never in floating point.**
+    Pro is sold through Google Play billing and Apple in-app purchase. The app hands over the
+    store's own proof — a Google purchase token, an Apple signed transaction — and nothing the
+    app says about it is used: the product, the account, whether it is paid and whether it was
+    a test all come from the store (Google's Developer API; Apple's signature, checked against
+    Apple Root CA - G3 by Apple's own library). Only `app/billing/purchases.py` records a store
+    purchase or grants one, because the app, both stores' notifications and the reconciler all
+    report the same purchase and all have to agree; it is idempotent on `(store, store_ref)`.
+    Entitlements are an append-only ledger folded in order — never a mutable expiry column
+    some code path edits — and a refund is a reversing row, never a delete. Any price this
+    backend handles is an integer number of paise.
 
 ## Conventions
 - Raw parameterized SQL via `asyncpg`, no ORM for now: the content schema is owned by the pipeline

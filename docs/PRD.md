@@ -102,7 +102,7 @@ Integrity rule: the question-fetch endpoints must not leak `correct_option_ids` 
 - **Weakness detection & analytics:** server-side aggregation of attempts by concept into mastery/weakness, with dashboard endpoints.
 - **Adaptive practice:** recommend questions targeting weak concepts.
 - **AI tutor:** LLM-backed explanations and doubt-solving (provider TBD).
-- **Payments:** an Indian gateway (e.g. Razorpay) with entitlement checks; payment data stays with the gateway (RBI localization), the backend stores only references/entitlement state.
+- **Payments:** Pro passes sold through Google Play billing (Android) and Apple in-app purchase (iPhone), as both stores require for digital content; the backend verifies every purchase with the store and keeps only references and entitlement state. (Was an Indian gateway, Razorpay, until October 2026 — see decision 15.)
 
 ## 6. Non-functional requirements
 
@@ -138,6 +138,7 @@ Integrity rule: the question-fetch endpoints must not leak `correct_option_ids` 
 | 12 | AI provider | Deferred |
 | 13 | Compliance | DPDP via handling (not forced localization); Singapore hosting; payment data localized in India via the gateway when payments arrive |
 | 14 | Content ownership | The pipeline authors content; the backend only reads it |
+| 15 | Payments (October 2026) | Pro is sold only inside the apps, through Google Play billing and Apple in-app purchase: 30/90/365-day passes (one-time products on Google, non-renewing subscriptions on Apple), India only. Razorpay is retired; India's user-choice billing was judged not worth ~1.4% per sale. Institutes pay outside the apps and their students get the same Pro on their accounts (Apple 3.1.3(b)). The backend verifies every purchase with the store and grants it on the same append-only ledger. |
 
 ---
 

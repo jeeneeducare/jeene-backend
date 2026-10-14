@@ -1,9 +1,10 @@
 #!/bin/sh
-# Ask the backend to sweep every payment it is still unsure about.
+# Ask the backend to sweep every store purchase it is still unsure about.
 #
-# Run by Render's cron every five minutes. It is a safety net, not the main path: three
-# other things confirm a payment first, and this one exists for when none of them arrive
-# — a phone that died on the success screen, a webhook dropped during a deploy.
+# Run by Render's cron every five minutes. It is a safety net, not the main path: the app
+# and the stores' own notifications confirm a purchase first, and this one exists for
+# when neither arrives — a phone that died after paying, a notification dropped during a
+# deploy, a Google purchase nobody consumed before Google's three-day refund.
 #
 # Idempotent, so a missed run costs nothing but a few minutes' delay for one student, and
 # a run that happens twice does nothing the first did not.

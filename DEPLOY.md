@@ -71,74 +71,79 @@ viewer streams the file through the API rather than handing the URL to the app.
 
 Render redeploys automatically on every push to the connected branch. No manual steps needed after the one-time setup above.
 
-## Payments (Razorpay)
+## Payments (Google Play and the App Store)
 
-Nothing here is optional-with-a-fallback the way Jeene Mode is. Billing ships **off**:
-with `JEENE_BILLING_ENABLED` unset, every money route answers 503 and says so. Turn it on
-only once all four steps below are done, in this order.
+Pro is sold only inside the apps: Google Play billing on Android, Apple in-app purchase on
+iPhone. The store takes the money; this backend checks every purchase with the store before
+granting anything. The console setup (agreements, fee programs, products, keys) is the app
+repo's `docs/tickets/002-store-billing-console-setup.md`.
+
+Billing ships **off**: with `JEENE_BILLING_ENABLED` unset, every store route answers 503
+and every gate passes. Each store is configured on its own, so one can go live first.
 
 ### 1. Apply the schema
 
-Same file, still safe to re-run:
+Same file, still safe to re-run (`./db/apply_schema.sh` shows what is missing first):
 
 ```
-psql "<the same DATABASE_URL Render uses>" -f db/backend_schema.sql
+./db/apply_schema.sh
 ```
 
-That adds `products`, `payments`, `entitlement_grants` and `users.pro_expires_at`. Nothing
-is dropped and no data is rewritten.
+It adds `store_purchases`, the store product ids on `products`, the private purchase id on
+`users`, and the purchase links on `entitlement_grants`. Nothing is dropped and no data is
+rewritten. `payments` stays as the record of what Razorpay took.
 
-### 2. Set the environment variables
+### 2. Put the store product ids on the passes
+
+```
+psql "<DATABASE_URL>" -v ON_ERROR_STOP=1 -f db/store_products.sql
+```
+
+It sets `pro_pass_30d` / `pro_pass_90d` / `pro_pass_365d` on the three passes and switches
+off the ₹1 `pro_smoke` test pass, then prints the result. The ids must match the consoles
+exactly; they can never be changed there.
+
+### 3. Set the environment variables
 
 On the **web service**:
 
 | Key | Value | Needed? |
 | --- | --- | --- |
-| `JEENE_BILLING_ENABLED` | `true` | **Yes**, or every money route answers 503 |
-| `RAZORPAY_KEY_ID` | `rzp_test_…` while testing, `rzp_live_…` after | **Yes** |
-| `RAZORPAY_KEY_SECRET` | the matching secret | **Yes** |
-| `JEENE_QUOTE_SECRET` | 64 hex characters from `python3 -c "import secrets; print(secrets.token_hex(32))"` | **Yes** |
-| `RAZORPAY_WEBHOOK_SECRET` | issued in step 3 | **Yes**, before going live |
-| `JEENE_RECONCILE_SECRET` | another 64 hex characters | **Yes** |
+| `JEENE_BILLING_ENABLED` | `true` | **Yes**, or every store route answers 503 |
+| `JEENE_RECONCILE_SECRET` | 64 hex characters | **Yes** |
+| `GOOGLE_PLAY_PACKAGE_NAME` | `com.jeeneeducareprivatelimited.jeeneeducareprivatelimited` | for Android |
+| `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` | the service account's whole JSON key | for Android |
+| `GOOGLE_PUBSUB_PUSH_SERVICE_ACCOUNT` | the account the push subscription signs as | for Google's notifications |
+| `GOOGLE_PUBSUB_PUSH_AUDIENCE` | `https://jeene-backend.onrender.com/billing/google/notifications` | for Google's notifications |
+| `APPLE_BUNDLE_ID` | the iOS bundle id | for iPhone |
+| `APPLE_APP_ID` | the app's numeric Apple ID | for real (production) iPhone purchases |
+| `APPLE_IAP_KEY_ID`, `APPLE_IAP_ISSUER_ID`, `APPLE_IAP_PRIVATE_KEY` | the In-App Purchase key (whole `.p8`) | for the reconciler's Apple sweep |
 
-Start in **test mode**. A test key id and a live key id differ by one word and produce
-identical-looking behaviour right up until real money moves.
+Remove `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` and
+`JEENE_QUOTE_SECRET`; nothing reads them any more.
 
-On the **cron service** (`jeene-billing-reconciler`, created from the blueprint):
-`JEENE_RECONCILE_SECRET`, set to exactly the same value as on the web service.
+On the **cron service** (`jeene-billing-reconciler`): `JEENE_RECONCILE_SECRET`, set to
+exactly the same value as on the web service.
 
-### 3. Register the webhook
+### 4. Point the stores at us
 
-In the Razorpay dashboard, **Settings → Webhooks → Add New Webhook**:
-
-- URL: `https://jeene-backend.onrender.com/billing/webhook`
-- Events: `payment.captured`, `payment.failed`, `order.paid`
-- Secret: generate one, and put the same value in `RAZORPAY_WEBHOOK_SECRET` on Render.
-
-The secret is what authenticates the webhook — that endpoint takes no user token, because
-Razorpay has none to give. Until `RAZORPAY_WEBHOOK_SECRET` is set, every webhook is
-rejected as unsigned, and payments are confirmed only by the app and the reconciler.
-
-### 4. Create the products
-
-Prices live in the database, not in the app and not in Razorpay. Seed the three passes:
-
-```
-psql "<DATABASE_URL>" -f db/testdata/seed_products.sql
-```
-
-or create them from the admin panel (`POST /admin/products`). Retiring one sets
-`active = false`; a product is never deleted, because a payment row points at it and a
-receipt has to keep making sense.
+- **Google:** a Pub/Sub push subscription on the `play-billing` topic, endpoint
+  `https://jeene-backend.onrender.com/billing/google/notifications`, authentication on with
+  the service account above; then Play Console → Monetize with Play → Monetization setup →
+  Real-time developer notifications, *all notifications for subscriptions and one-time
+  products*, and **Send Test Message**. The log should say `Google test notification received`.
+- **Apple:** App Store Connect → App Information → App Store Server Notifications →
+  Production Server URL `https://jeene-backend.onrender.com/billing/apple/notifications`,
+  Version 2. Leave the Sandbox URL empty so test-environment notifications come here too:
+  Apple's reviewers buy in the test environment, against this backend.
 
 ### What `JEENE_BILLING_ENABLED` actually switches on
 
 Read this before setting it to `true` in production, because it does two things at once.
 
-It turns on **selling** — the money routes stop answering 503 — and it turns on
+It turns on **selling** — the store routes stop answering 503 — and it turns on
 **locking**. Until it is set, every gate in `app/billing/gates.py` passes and the app
-behaves exactly as it does today. The moment it is set, existing students who are not Pro
-find:
+behaves as if everyone were Pro. The moment it is set, students who are not Pro find:
 
 | | Free | Pro |
 | --- | --- | --- |
@@ -149,38 +154,34 @@ find:
 | Mistake Book, progress, the report, browsing the syllabus | always free | always free |
 
 The two are deliberately one switch. A student who meets a paywall on a deployment that
-cannot take their money has hit a dead end, and that is a worse first impression than
-anything on the other side of it.
-
-So: set the Razorpay variables, walk the test-mode matrix, ship the apps that understand
-a `402`, and only then set this. Turning it off again unlocks everything instantly —
-entitlements are untouched, so anyone who has paid keeps what they paid for.
+cannot sell to them has hit a dead end. Turning it off again unlocks everything instantly
+— entitlements are untouched, so anyone who has paid keeps what they paid for.
 
 Every number above lives in one block at the top of `app/billing/gates.py`.
 
-### How a payment is confirmed
+### How a purchase is confirmed
 
-Four independent paths, because each fails in a way the others do not, and all four go
-through one idempotent mutator (`app/billing/settle.py`):
+Three paths, because each fails in a way the others do not, all through one idempotent
+module (`app/billing/purchases.py`):
 
-1. **the app**, on the checkout SDK's success callback — signature checked, then the
-   payment fetched server-to-server, because a signature proves the callback is genuine
-   and not that money moved;
-2. **the webhook**, signed over the raw body;
-3. **a failure report** from the app, which is ignored outright if Razorpay says
-   something was captured;
-4. **the reconciler**, every five minutes, asking about everything still pending.
+1. **the app** hands the store's proof over (`POST /billing/purchases`) right after paying,
+   and again for anything it finds unfinished at launch;
+2. **the stores' notifications** — Google's through Pub/Sub, Apple's directly — for
+   purchases that complete later (a UPI payment, a parent's Ask to Buy) and for refunds;
+3. **the reconciler**, every five minutes: consumes Google purchases before Google refunds
+   anything unacknowledged for three days, settles pending ones, applies refunds nobody
+   announced, and reads back Apple's undelivered notifications.
 
-A payment that is captured after we have already given up on it goes to
-`needs_manual_review` rather than quietly to `paid`. Watch for those:
+A refund takes the pass's days back with a reversing grant, once, however many times it is
+reported. Test purchases (Apple's test environment, Google's license testers) grant Pro like
+real ones and are recorded with `environment = 'sandbox'`; leave them out of revenue:
 
 ```sql
-SELECT order_id, firebase_uid, amount_paise, failure_reason, updated_at
-  FROM payments WHERE status = 'needs_manual_review' ORDER BY updated_at DESC;
+SELECT store, count(*), sum(price_micros) / 1000000 AS rupees
+  FROM store_purchases
+ WHERE environment = 'production' AND status = 'granted'
+ GROUP BY store;
 ```
-
-Each one is a person deciding between granting access and refunding — by then the student
-has been told it failed and may well have paid again.
 
 ## Ask Jeene (doubt solving)
 

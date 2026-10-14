@@ -51,26 +51,37 @@ services:
       # could sit a paper on a student's behalf. Both Firebase Hosting domains for
       # the project are listed because either can serve the same deploy, and both the
       # apex and www of the custom domain because CORS matches an origin exactly.
-      # --- Billing (Razorpay) -----------------------------------------------------
-      # Ships off. With the flag unset the money routes answer 503 and say so, which is
-      # the right behaviour for a half-configured deployment: refusing to take a payment
-      # is recoverable, taking one it cannot confirm is not.
+      # --- Billing (Google Play and the App Store) ---------------------------------
+      # Ships off. With the flag unset the store routes answer 503 and every gate passes,
+      # which is the right behaviour for a half-configured deployment: refusing to confirm
+      # a purchase is recoverable (the stores retry, and so does the app), granting one we
+      # could not check is not.
       - key: JEENE_BILLING_ENABLED
         sync: false
-      # Only the key id ever reaches the app. The secret authenticates our calls to
-      # Razorpay *and* is the HMAC key that proves a success callback is genuine, so it
-      # never leaves the server; the webhook secret signs webhook bodies and is a
-      # different value, issued when the webhook is registered.
-      - key: RAZORPAY_KEY_ID
+      # --- Google Play. The service account's whole JSON key, as with Firebase's.
+      # Server only: it can read orders and consume purchases. The push pair is the
+      # service account and audience set on the Pub/Sub push subscription; together they
+      # are the only authentication /billing/google/notifications has.
+      - key: GOOGLE_PLAY_PACKAGE_NAME
         sync: false
-      - key: RAZORPAY_KEY_SECRET
+      - key: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
         sync: false
-      - key: RAZORPAY_WEBHOOK_SECRET
+      - key: GOOGLE_PUBSUB_PUSH_SERVICE_ACCOUNT
         sync: false
-      # Signs price quotes, so a client cannot name its own price. Generate once with
-      # `python3 -c "import secrets; print(secrets.token_hex(32))"`. Rotating it
-      # invalidates outstanding quotes, which is harmless — they live ten minutes.
-      - key: JEENE_QUOTE_SECRET
+      - key: GOOGLE_PUBSUB_PUSH_AUDIENCE
+        sync: false
+      # --- The App Store. The bundle id verifies test-environment purchases; production
+      # ones also need the numeric Apple ID. The In-App Purchase key lets the reconciler
+      # read notifications Apple could not deliver; paste the whole .p8 file.
+      - key: APPLE_BUNDLE_ID
+        sync: false
+      - key: APPLE_APP_ID
+        sync: false
+      - key: APPLE_IAP_KEY_ID
+        sync: false
+      - key: APPLE_IAP_ISSUER_ID
+        sync: false
+      - key: APPLE_IAP_PRIVATE_KEY
         sync: false
       # What the reconciler cron presents. Not a user credential and never sent to a
       # client; the same value goes on the cron service below. Unset, the reconcile
@@ -80,11 +91,11 @@ services:
       - key: JEENE_WEB_ORIGINS
         value: https://jeene-ff8e3.web.app,https://jeene-ff8e3.firebaseapp.com,https://jeeneeducare.com,https://www.jeeneeducare.com,https://jeene-admin.web.app,https://jeene-admin.firebaseapp.com
 
-  # The fourth confirmation path. The other three depend on a message arriving — a
-  # success callback, a webhook, a failure report — and each has a way of not arriving.
-  # This one asks Razorpay directly about every payment still pending, which is what
-  # closes a purchase when a phone dies on the success screen or a webhook lands during a
-  # deploy.
+  # The last confirmation path. The other two depend on something arriving — the app
+  # handing a purchase over, a store's notification — and each has a way of not
+  # arriving. This one asks the stores directly: it consumes Google purchases before
+  # Google's three-day automatic refund, settles pending ones, applies refunds nobody
+  # announced, and reads back Apple's undelivered notifications.
   #
   # Every five minutes, because a student waiting to be let into what they just paid for
   # is the thing being minimised. The sweep is idempotent and usually finds nothing, so a
