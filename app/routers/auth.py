@@ -1,6 +1,7 @@
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
+from app import account_deletion
 from app.auth import require_user
 from app.db import get_connection
 from app.schemas import ProfileUpdate, SessionRequest, UserProfile
@@ -58,6 +59,9 @@ async def create_session(
             class_level   = COALESCE(EXCLUDED.class_level, users.class_level),
             target_exam   = COALESCE(EXCLUDED.target_exam, users.target_exam),
             photo_url     = COALESCE(users.photo_url, EXCLUDED.photo_url),
+            -- Signing in again after a deletion whose sign-in half failed: the data is
+            -- gone, and this is a new account in the old account's row.
+            deleted_at    = NULL,
             last_login_at = now(),
             updated_at    = now()
         RETURNING {_PROFILE_COLUMNS}, (xmax = 0) AS is_new
@@ -113,3 +117,26 @@ async def update_me(
     if row is None:
         raise HTTPException(status_code=404, detail="User has no session yet; call /auth/session first")
     return _to_profile(row)
+
+
+@router.delete("/auth/me", status_code=204)
+async def delete_me(
+    user: dict = Depends(require_user),
+    connection: asyncpg.Connection = Depends(get_connection),
+) -> Response:
+    """Delete this student's account: their data, their sign-in and their photo.
+
+    See `app/account_deletion.py` for what is kept (only anonymised purchase records)
+    and why the database goes first. Idempotent, so the app can simply ask again after a
+    failure: a second call finds nothing to erase and retries only the sign-in.
+    """
+    _, photo_url = await account_deletion.erase(connection, user["uid"])
+    try:
+        await account_deletion.delete_identity(user["uid"], photo_url)
+    except account_deletion.IdentityDeletionFailed as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Your data is deleted, but we could not finish closing your account. "
+                   "Try again in a moment.",
+        ) from exc
+    return Response(status_code=204)

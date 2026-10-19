@@ -18,6 +18,14 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE INDEX IF NOT EXISTS idx_users_tenant ON users (tenant_id);
 
+-- When the student deleted their account, for the rows that have to outlive it.
+--
+-- A student who never bought anything is deleted outright, and every row of theirs goes
+-- with the `users` row. One who did keeps a row with every personal field emptied:
+-- purchase records must be kept for tax law, and a refund a store reports months later
+-- still has to find the purchase it names. This marks that row as nobody's any more.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
 -- Attempts: an append-only event log of every answer a student submits.
 --
 -- Append-only on purpose. The same question answered three times is three rows;

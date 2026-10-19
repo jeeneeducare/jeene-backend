@@ -60,6 +60,9 @@ FROM (
   UNION ALL SELECT 'column purchase_id', EXISTS (
       SELECT 1 FROM information_schema.columns
        WHERE table_name = 'entitlement_grants' AND column_name = 'purchase_id')
+  UNION ALL SELECT 'column users.deleted_at', EXISTS (
+      SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'users' AND column_name = 'deleted_at')
   UNION ALL SELECT 'column reverses_grant_id', EXISTS (
       SELECT 1 FROM information_schema.columns
        WHERE table_name = 'entitlement_grants' AND column_name = 'reverses_grant_id')
