@@ -50,22 +50,24 @@ FROM (
   UNION ALL SELECT 'table store_purchases',       to_regclass('public.store_purchases')       IS NOT NULL
   UNION ALL SELECT 'column google_product_id', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'products' AND column_name = 'google_product_id')
+       WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'google_product_id')
   UNION ALL SELECT 'column apple_product_id', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'products' AND column_name = 'apple_product_id')
+       WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'apple_product_id')
   UNION ALL SELECT 'column store_account_token', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'users' AND column_name = 'store_account_token')
+       WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'store_account_token')
   UNION ALL SELECT 'column purchase_id', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'entitlement_grants' AND column_name = 'purchase_id')
+       WHERE table_schema = 'public' AND table_name = 'entitlement_grants' AND column_name = 'purchase_id')
+  -- Scoped to public: Supabase's own auth.users has a deleted_at, and an unscoped check
+  -- reports ours present when it is not.
   UNION ALL SELECT 'column users.deleted_at', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'users' AND column_name = 'deleted_at')
+       WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'deleted_at')
   UNION ALL SELECT 'column reverses_grant_id', EXISTS (
       SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'entitlement_grants' AND column_name = 'reverses_grant_id')
+       WHERE table_schema = 'public' AND table_name = 'entitlement_grants' AND column_name = 'reverses_grant_id')
 ) t ORDER BY obj;
 SQL
 
