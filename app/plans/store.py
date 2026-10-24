@@ -147,12 +147,22 @@ class LimitReached(Exception):
     Carries the HTTP status the router should use, so the decision about *which* limit
     was reached stays with the code that knows the limits, and the router only has to
     translate. Not an HTTPException, because the store has no business importing FastAPI.
+
+    Every `detail` here is written for the student rather than for a log, and the router
+    sends them as such. That is the difference between "you already have 3 plans on the
+    go, archive one first" and the app's own line for a 409, which used to be shown
+    instead: "Something changed while you were here. Try again." Nothing had changed,
+    and trying again would have failed every time until a plan was archived.
+
+    `action` is the machine-readable half of the same sentence, for an app that wants to
+    offer the way out rather than only describe it. Advisory: the sentence stands alone.
     """
 
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, action: str | None = None):
         super().__init__(detail)
         self.status = status
         self.detail = detail
+        self.action = action
 
 
 async def reserve_generation(
@@ -215,13 +225,16 @@ async def reserve_generation(
                 # rather than a full shelf, and telling them to archive nothing would be
                 # nonsense.
                 raise LimitReached(
-                    409, "A plan is already being built for you. Give it a moment."
+                    409,
+                    "A plan is already being built for you. Give it a moment.",
+                    action="wait",
                 )
             raise LimitReached(
                 409,
                 f"You already have {len(active)} plans on the go. Archive one first — "
                 f"'{active[0]['scope_title']}' is the one you have not touched in "
                 "longest.",
+                action="archive_plan",
             )
 
         spend = await connection.fetchrow(
@@ -234,11 +247,15 @@ async def reserve_generation(
         )
         if spend["hour"] >= MAX_PLANS_PER_HOUR:
             raise LimitReached(
-                429, "That is a lot of new plans in an hour. Try again a bit later."
+                429,
+                "That is a lot of new plans in an hour. Try again a bit later.",
+                action="wait",
             )
         if spend["day"] >= MAX_PLANS_PER_DAY:
             raise LimitReached(
-                429, "You have started a lot of plans today. Try again tomorrow."
+                429,
+                "You have started a lot of plans today. Try again tomorrow.",
+                action="wait",
             )
 
         generation_id = uuid.uuid4()

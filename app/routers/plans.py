@@ -46,6 +46,8 @@ from app.plans.scope import SCOPE_TYPES, resolve_scope
 from app.plans.resolve import resolve_selector
 from app.providers.openai_provider import build_provider
 from app.questions import fetch_questions_by_ids
+from app import refusals
+from app.refusals import refuse
 from app.visibility import resolve_exam_track
 from app.schemas import (
     CheckpointResult,
@@ -195,14 +197,16 @@ def _rate_limit_reads(uid: str) -> None:
     now = time.time()
     hits = [t for t in _recent_reads[uid] if now - t < 86400]
     if sum(1 for t in hits if now - t < 3600) >= _READS_PER_HOUR:
-        raise HTTPException(
-            status_code=429,
-            detail="Give me a moment to catch up — try again in a few minutes.",
+        raise refuse(
+            429,
+            "Give me a moment to catch up — try again in a few minutes.",
+            action=refusals.WAIT,
         )
     if len(hits) >= _READS_PER_DAY:
-        raise HTTPException(
-            status_code=429,
-            detail="That is a lot of planning for one day. Try again tomorrow.",
+        raise refuse(
+            429,
+            "That is a lot of planning for one day. Try again tomorrow.",
+            action=refusals.WAIT,
         )
     hits.append(now)
     _recent_reads[uid] = hits
@@ -485,15 +489,17 @@ async def create_plan(
         # slots, and five refusals. Building the inventory is a read; it is the cheap
         # half of this route and belongs on the free side of the line.
         if not inventory.question_buckets:
-            raise HTTPException(status_code=409, detail=_nothing_to_plan(scope))
+            raise refuse(409, _nothing_to_plan(scope))
 
         try:
             generation_id = await store.reserve_generation(
                 connection, user["uid"], tenant, body.scope_node_id
             )
         except store.LimitReached as limit:
-            raise HTTPException(
-                status_code=limit.status, detail=limit.detail
+            # Sent as a student-facing refusal, not a plain detail. Each of these says
+            # what to do next, and the app's own line for the status does not.
+            raise refuse(
+                limit.status, limit.detail, action=limit.action
             ) from limit
 
     # Phase two: the wait. No connection is held here, on purpose.
@@ -515,7 +521,7 @@ async def create_plan(
             # worse than an error — it sits in the history looking like work the student
             # failed to do.
             await store.finish_generation(connection, generation_id, "failed")
-            raise HTTPException(status_code=409, detail=_nothing_to_plan(scope))
+            raise refuse(409, _nothing_to_plan(scope))
 
         try:
             plan_id = await store.save_plan(
